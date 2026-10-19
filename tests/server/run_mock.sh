@@ -18,6 +18,7 @@ $PY tests/server/test_tokcache.py | grep -v '^ok'; [ ${pipestatus[1]} = 0 ] || r
 $PY tests/server/test_worker_robust.py 2>&1 | grep -v '^ok\|^  \|^Traceback\|^RuntimeError'; [ ${pipestatus[1]} = 0 ] || rc=1   # the engine thread survives bugs (lab-fixsrv)
 $PY tests/server/test_limits.py | grep -v '^ok'; [ ${pipestatus[1]} = 0 ] || rc=1   # image path allowlist, pixel cap, close of every cache (lab-fixsrv)
 $PY tests/server/test_special_text.py | grep -v '^ok'; [ ${pipestatus[1]} = 0 ] || rc=1   # literal special-token text in messages stays text (lab-fixsrv)
+$PY tests/server/test_model_id.py | grep -v '^ok'; [ ${pipestatus[1]} = 0 ] || rc=1   # a request naming a model that is not served is a 400, never the default (lab-dflash)
 for delay in 0 0.014; do
   $PY server/ne_server.py --mock --mock-delay $delay --port $PORT --key-file $T/key --ctx 32768 2> $T/log &
   SP=$!
@@ -32,13 +33,13 @@ for delay in 0 0.014; do
   kill $SP; wait $SP 2>/dev/null
 done
 echo "--- robustness over HTTP (mock engine, 10 ms per token, prefill 20K tok/s, SSE keepalive 0.2 s, 1 MB body cap, 2 s socket timeout): disconnects, cut-off tool calls, keepalives, limits"
-NE_SRV_KEEPALIVE_S=0.2 NE_SRV_MAX_BODY_MB=1 NE_SRV_SOCKET_TIMEOUT=2 $PY server/ne_server.py --mock --mock-delay 0.01 --mock-prefill-rate 20000 --port $PORT --key-file $T/key --ctx 32768 2> $T/log6 &
+NE_SRV_KEEPALIVE_S=0.2 NE_SRV_MAX_BODY_MB=1 NE_SRV_SOCKET_TIMEOUT=2 $PY server/ne_server.py --mock --mock-delay 0.01 --mock-prefill-rate 20000 --port $PORT --key-file $T/key --ctx 32768 --allow-any-model 2> $T/log6 &
 SP=$!
 for i in {1..60}; do curl -s -m 1 http://127.0.0.1:$PORT/health >/dev/null 2>&1 && break; sleep 0.5; done
 $PY tests/server/test_robust_http.py --prefill --url http://127.0.0.1:$PORT --key-file $T/key | grep -v '^ok' ; [ ${pipestatus[1]} = 0 ] || rc=1
 kill $SP; wait $SP 2>/dev/null
 echo "--- slot scheduler over HTTP (mock engine, --slots 2)"
-$PY server/ne_server.py --mock --mock-delay 0.004 --slots 2 --port $PORT --key-file $T/key --ctx 32768 2> $T/log2 &
+$PY server/ne_server.py --mock --mock-delay 0.004 --slots 2 --port $PORT --key-file $T/key --ctx 32768 --allow-any-model 2> $T/log2 &
 SP=$!
 for i in {1..60}; do curl -s -m 1 http://127.0.0.1:$PORT/health >/dev/null 2>&1 && break; sleep 0.5; done
 $PY tests/server/test_sched_http.py --url http://127.0.0.1:$PORT --key-file $T/key | grep -v '^ok' ; [ ${pipestatus[1]} = 0 ] || rc=1

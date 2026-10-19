@@ -52,9 +52,9 @@
 <circle class="s-Ijah" cx="435.6" cy="288.1" r="9" fill="none" stroke-width="3"><title>Ijah with 4-bit experts: 105.2 tok/s (95% CI 101.0-109.3), KLD 0.0185 [0.0136, 0.0260] (Sushi-4bpw expert shards + Ijah's T6 trunk)</title></circle>
 <text class="t1" x="423.6" y="310.1" font-size="13" text-anchor="end" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">Ijah, 4-bit experts (experiment)</text>
 <line class="err" x1="606.8" y1="364.1" x2="707.8" y2="364.1" stroke-width="1.5"/><line class="err" x1="606.8" y1="359.1" x2="606.8" y2="369.1" stroke-width="1.5"/><line class="err" x1="707.8" y1="359.1" x2="707.8" y2="369.1" stroke-width="1.5"/>
-<circle class="s-Ijah" cx="658.0" cy="364.1" r="9" fill="none" stroke-width="3" stroke-dasharray="3 3"><title>Ijah with the DFlash2 drafter: 120.4 tok/s (95% CI 116.9-123.8), same T6 pack so the same KLD 0.0092; 19 Oct lab build, not in this release</title></circle>
-<text class="t1" x="646.0" y="404.1" font-size="13" text-anchor="end" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">Ijah + DFlash2 drafter (lab build)</text>
+<circle class="c-Ijah gap" cx="658.0" cy="364.1" r="9" stroke-width="2"><title>Ijah with the DFlash2 drafter (--drafter dflash2, off by default): 120.4 tok/s (95% CI 116.9-123.8, derived from the paired ratios), same T6 pack so the same KLD 0.0092; measured 19 Oct on a build whose MTP-only baseline was 112.4 tok/s</title></circle>
+<text class="t1" x="646.0" y="404.1" font-size="13" text-anchor="end" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">Ijah + DFlash2 drafter (opt-in)</text>
 <text class="t3" x="40" y="468" font-size="11.5">Whiskers: decode 95% CI over 6 prompts x 3 seeds (same client); KLD 95% bootstrap CI over windows.</text>
-<text class="t3" x="40" y="485" font-size="11.5">Hollow markers are lab work, not this release: 4-bit experts (not a published pack) and the DFlash2 drafter (not in this tree).</text>
-<text class="t3" x="40" y="502" font-size="11.5">The DFlash2 point is a 19 Oct build, whose MTP-only baseline was 112.4 tok/s: read it against that, not against the 98.9 bar.</text>
+<text class="t3" x="40" y="485" font-size="11.5">Hollow marker: an experiment with 4-bit experts (not a published pack); the published Ijah pack uses 5-bit experts.</text>
+<text class="t3" x="40" y="502" font-size="11.5">The DFlash2 point is a 19 Oct measurement on a build whose MTP-only baseline was 112.4 tok/s: read it against that, not against 98.9.</text>
 </svg>

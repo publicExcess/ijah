@@ -166,7 +166,7 @@ void record_gdn_rollback(Recorder &r, GdnState &st, LayerExtra &ex, int rows, co
 void record_hc_pre(Recorder &r, int R, const HcW &hw, const Tensor &h, const Tensor &mix, const Tensor &inj,
                    Scratch &s, LayerExtra &ex) {
   const int n = R == 8 ? 4 : R;
-  NE_CHECK(R <= 6 || R == 8, "hc_pre rows %d", R);
+  NE_CHECK(R <= 7 || R == 8, "hc_pre rows %d", R);
   auto p = Pipelines::get("fn_hc_pre_g" + std::to_string(hw.down.group) + "_r" + std::to_string(n), {FC::b(0, g_ref_round)});
   for (int half = 0; half < (R == 8 ? 2 : 1); half++)
     r.dispatch(p, {h.rows(n * half, n), hw.norm, hw.down.w, hw.down.s, hw.down.b, hw.inject, mix.rows(n * half, n),

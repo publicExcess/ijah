@@ -68,6 +68,9 @@ struct PfStats {
 const PfStats &prefill_stats(const Prefill &p);
 // tests: the chunk's hidden streams after `layers` layers (f32 [C][4][2560], rows of the last chunk)
 const Tensor &prefill_hidden(const Prefill &p, int layers);
+// lab-dflash (docs/mtp.md 13): chunks write the DFlash2 features of their last <= 2048 rows into fs (f32 [2048][12800],
+// row = position % 2048); nullptr = off. Clears the chunk recordings when it changes.
+void prefill_set_dfl(Prefill &p, const Tensor *fs);
 
 }  // namespace ne::fn
 

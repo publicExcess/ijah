@@ -19,7 +19,7 @@
 <line class="grid" x1="259.0" y1="156" x2="259.0" y2="264" stroke-width="1"/>
 <line class="grid" x1="300.0" y1="156" x2="300.0" y2="264" stroke-width="1"/>
 <text class="t2" x="126" y="174" font-size="13" text-anchor="end" font-weight="700">Ijah</text><text class="t3" x="126" y="187" font-size="9.5" text-anchor="end">5b · 6/8b</text>
-<path class="c-Ijah" d="M136,164 h128.6 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-128.6 z"><title>Ijah: 98.9 tok/s — T6 pack, MTP depth 2 (--seed-mtp), SD 10.2, range 83-119; with 4-bit experts 105.2; with the DFlash2 drafter 120.4 (19 Oct lab build, not in this release)</title></path>
+<path class="c-Ijah" d="M136,164 h128.6 a4,4 0 0 1 4,4 v14 a4,4 0 0 1 -4,4 h-128.6 z"><title>Ijah: 98.9 tok/s — T6 pack, MTP depth 2 (--seed-mtp), SD 10.2, range 83-119; with 4-bit experts 105.2; with the opt-in DFlash2 drafter 120.4 (19 Oct, that build's MTP baseline 112.4)</title></path>
 <line class="err" x1="262.6" y1="175.0" x2="274.9" y2="175.0" stroke-width="1.5"/><line class="err" x1="262.6" y1="169.0" x2="262.6" y2="181.0" stroke-width="1.5"/><line class="err" x1="274.9" y1="169.0" x2="274.9" y2="181.0" stroke-width="1.5"/>
 <text class="t1" x="282.9" y="180" font-size="13" font-weight="700">98.9</text>
 <text class="t2" x="126" y="210" font-size="13" text-anchor="end">oMLX</text><text class="t3" x="126" y="223" font-size="9.5" text-anchor="end">oQ4e 4.72b</text>
@@ -71,5 +71,5 @@
 <text class="t3" x="40" y="334" font-size="11.5">Prefill: cold prompts with no cache hit, median of 5 runs, whiskers = min-max.</text>
 <text class="t3" x="40" y="351" font-size="11.5">One streaming client for all three, each on its own weights and best settings (oMLX: MTP depth 2, INT8-activation prefill).</text>
 <text class="t3" x="40" y="368" font-size="11.5">Engine + weights, not engine alone: Sushi ran its 4-bit-expert Sushi-4bpw pack, oMLX the 4.72 bpw oQ4e, Ijah its 5-bit-expert T6 pack.</text>
-<text class="t3" x="40" y="385" font-size="11.5">18 Oct 2026, M5 Max 128 GB. Ijah with the DFlash2 drafter measured 120.4 tok/s on a 19 Oct lab build (not in this release).</text>
+<text class="t3" x="40" y="385" font-size="11.5">18 Oct 2026, M5 Max 128 GB. With the opt-in DFlash2 drafter Ijah measured 120.4 tok/s (19 Oct, on a build whose MTP-only baseline was 112.4).</text>
 </svg>

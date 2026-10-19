@@ -87,7 +87,19 @@ struct Model {
   Tensor vfeat;               // bf16 [vcap][2560]: image embeddings (NE_VISION_ROWS rows, default 16384)
   std::vector<int32_t> vmap;  // cache row -> vfeat row (-1 or past the end: the token's embedding)
   int vcap = 0;
+  // lab-dflash (docs/mtp.md 13): DFlash2 target features of every 1-row / 4-row step (set_dfl_capture): the 4-stream
+  // mean of layers kDflLayers' outputs -> dfl_f f32 [4][5 * 2560]
+  bool dfl_cap = false;
+  Tensor dfl_f;
 };
+// lab-dflash: the target layers whose completed outputs (4 HC streams averaged) are the DFlash2 drafter's features
+constexpr int kDflLayers[5] = {5, 15, 25, 35, 45};
+inline int dfl_slot(int l) {
+  for (int i = 0; i < 5; i++) if (kDflLayers[i] == l) return i;
+  return -1;
+}
+// re-records the step recordings with (or without) the feature capture (lab-dflash)
+void set_dfl_capture(Model &m, bool on);
 // The id written into a token buffer for cache row `row`: VOCAB + the vfeat row for image rows (fn_embed reads the
 // image embedding), else the token itself.
 inline uint32_t embed_id(const Model &m, int row, int token) {

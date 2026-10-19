@@ -66,6 +66,7 @@ def main():
     ap.add_argument("--runs", type=int, default=400)
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--prompt", default="text_crisis")
+    ap.add_argument("--dflash", default="", help="lab-dflash: DFlash2 checkpoint dir (its gated rounds draft)")
     a = ap.parse_args()
     tok = Tokenizer.from_file(str(Path(a.pack) / "tokenizer.json"))
     ids = tok.encode(B.chat(a.pack, B.THINK[a.prompt]), add_special_tokens=False).ids
@@ -73,6 +74,12 @@ def main():
     pack = eng.pack_open(a.pack)
     m = eng.fn_model(pack, 1024)
     mtp = B.Mtp(eng, m, max(4, a.depth), 4)
+    if a.dflash:  # lab-dflash (docs/mtp.md 13)
+        import ctypes as C
+        en = eng.lib.ne_fn_dfl_enable
+        en.restype, en.argtypes = C.c_int, [C.c_void_p, C.c_char_p, C.c_int, C.c_int, C.c_int, C.c_int]
+        if en(C.c_void_p(mtp.ptr), a.dflash.encode(), 8, max(4, a.depth), 8, 1):
+            raise E.EngineError(eng.last_error())
     # find a spot with entropy: along the greedy continuation, position j whose token is certain under the filter
     # (so x_P = cont[j] whatever the seed) and whose next token has >= 5 ids and top <= 0.7
     m.set_sampler(0.0, 1.0, 1, 0)

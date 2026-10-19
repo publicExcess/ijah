@@ -76,9 +76,24 @@ static void record_a(Model &m, Recorder &r, Scratch &s, const Tensor &tok, const
 }
 static void record_b(Model &m, Recorder &r, Scratch &s, const Tensor *h, bool head) {
   r.begin();
-  for (size_t l = 1; l < m.L.size(); l++) record_gdn_layer(r, m.L[l], m.st[l], s, h[l % 2], h[(l + 1) % 2]);
+  for (size_t l = 1; l < m.L.size(); l++) {
+    record_gdn_layer(r, m.L[l], m.st[l], s, h[l % 2], h[(l + 1) % 2]);
+    if (m.dfl_cap && dfl_slot((int)l) >= 0) {  // lab-dflash: the drafter's features of this step's rows
+      struct { uint32_t x, y, z, w; } a{(uint32_t)s.rows, (uint32_t)dfl_slot((int)l), 0, 0};
+      r.dispatch(pso("dfl_hc_mean"), {h[(l + 1) % 2], m.dfl_f, Arg::value(a)}, sz1(s.rows * 10), sz1(256));
+    }
+  }
   if (head) record_head(m, r, h[m.L.size() % 2]);
   r.end();
+}
+void set_dfl_capture(Model &m, bool on) {
+  if (m.dfl_cap == on) return;
+  if (on && !m.dfl_f.buf) m.dfl_f = alloc(DType::F32, {4, 5 * HID});
+  m.dfl_cap = on;
+  record_b(m, *m.rec_b, m.s, m.h, true);
+  if (m.rec_b4) record_b(m, *m.rec_b4, m.s4, m.h4, false);
+  m.n_full = m.rec_a->size() + m.rec_b->size();
+  m.n_body = m.n_full - 5;
 }
 
 Model::~Model() {

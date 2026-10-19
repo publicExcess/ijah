@@ -3,6 +3,10 @@
  "default": "Qwen3.8-Flash-Next-native",
  "models": {
   "Qwen3.8-Flash-Next-native": {"packs": ["@IJAH_PACKS/Qwen3.8-Flash-Next-EXL3-Ijah"]},
-  "Swift-1.5-Flash-Next-native": {"packs": ["@IJAH_PACKS/Swift-1.5-Flash-Next-EXL3-Ijah"]}
+  "Swift-1.5-Flash-Next-native": {"packs": ["@IJAH_PACKS/Swift-1.5-Flash-Next-EXL3-Ijah"]},
+  "Swift-1.5-Flash-Next-native-dflash": {
+   "packs": ["@IJAH_PACKS/Swift-1.5-Flash-Next-EXL3-Ijah"],
+   "_doc": "The same Swift-1.5 weights, served with the DFlash2 block drafter on (+7-10% decode, docs/mtp.md 13). The drafter is a server start flag, so it is a model id here: clients pick it with `model`. Start it with tools/serve.sh start -- --mtp 5 --drafter dflash2 --drafter-path ~/.cache/ijah/drafters/Qwen3.8-Flash-Next-DFlash2 (hf download incoai/Qwen3.8-Flash-Next-DFlash2 --local-dir that path). A server started without --drafter does not advertise this id, and a plain id on a drafter server is refused, so a drafter run and its control cannot be confused (docs/server.md 13). The drafter is Inco's Qwen3.8-Flash-Next-DFlash2 (Apache-2.0); it drafts Swift-1.5, the fine-tune of the same architecture."
+  }
  }
 }

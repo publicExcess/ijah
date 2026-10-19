@@ -12,7 +12,9 @@ updated file; 4,096 tokens). Configs (comma list, run alternately in one process
     copy    = pruned + the copy rule (16-token windows)      fullcopy = full + the copy rule
     gate    = pruned + the gated verify (NE_MTP_QGATE)       gatecopy = gate + the copy rule
     a config may add "@key" options: vocab=<NE_MTP_DRAFT_VOCAB value>, copymin=<N>, copyd=<depth>, qgate=<0/1>,
-    split=<0/1>, dedupe=<0/1/N> (lab-verify: routed experts read once per verify for all rows routed to them), e.g. copy@copyd=3
+    split=<0/1>, dedupe=<0/1/N> (lab-verify: routed experts read once per verify for all rows routed to them), e.g. copy@copyd=3;
+    lab-dflash (--dflash DIR): dfl=<0/1> (the DFlash2 block drafter drafts the rounds), dgate=<0/1>, dk=<kmax>,
+    e.g. copy@dfl=1 vs copy (run with --max-depth 5 for kmax 5)
 tok/s = tokens after the prefill's first / decode wall (tools/bench_mtp.py's definition). Per round the loop writes a
 trace line (NE_MTP_TRACE; columns in mtp_loop.mm generate_impl); the summary splits a round into draft GPU, verify A /
 B GPU and the host gap, by depth. --prof: ne_fn_mtp_prof (each part of a round on its own) at T 512 and 2048.
@@ -96,6 +98,9 @@ def parse_config(c):
     d.setdefault("qgate", 0)
     d.setdefault("split", -1)   # lab-verify: routed gate / up split by multiplicity (NE_FN_MOE_SPLIT)
     d.setdefault("dedupe", -1)  # lab-verify: routed-expert dedupe across verify rows (-1 = the engine's default)
+    d.setdefault("dfl", 0)      # lab-dflash: the DFlash2 drafter active
+    d.setdefault("dgate", 1)
+    d.setdefault("dk", 0)
     for o in filter(None, opts.split("@")):
         k, _, v = o.partition("=")
         d[k] = v if k == "vocab" else int(v)
@@ -146,6 +151,9 @@ def main():
     ap.add_argument("--prof", action="store_true")
     ap.add_argument("--json", default="")
     ap.add_argument("--trace", default="")
+    ap.add_argument("--dflash", default="", help="lab-dflash: DFlash2 checkpoint dir (enables the drafter; configs @dfl=1)")
+    ap.add_argument("--dflash-block", type=int, default=8)
+    ap.add_argument("--dflash-bits", type=int, default=8)
     a = ap.parse_args()
     trace = a.trace or (a.json + ".trace" if a.json else "")
     if trace:
@@ -173,6 +181,14 @@ def main():
     lib.ne_fn_mtp_set_moe_dedupe.argtypes = [C.c_void_p, C.c_int]
     lib.ne_fn_mtp_set_moe_split.argtypes = [C.c_void_p, C.c_int]
     lib.ne_fn_mtp_prof.argtypes = [C.c_void_p, C.c_int, C.c_int, C.c_void_p, C.c_int]
+    if a.dflash:
+        lib.ne_fn_dfl_enable.argtypes = [C.c_void_p, C.c_char_p, C.c_int, C.c_int, C.c_int, C.c_int]
+        lib.ne_fn_dfl_set.argtypes = [C.c_void_p, C.c_int, C.c_int, C.c_int]
+        lib.ne_fn_dfl_last.argtypes = [C.c_void_p, C.c_void_p, C.c_void_p]
+        t1 = time.time()
+        eng._ok(lib.ne_fn_dfl_enable(C.c_void_p(mtp.ptr), a.dflash.encode(), a.dflash_block, a.max_depth,
+                                     a.dflash_bits, 1), "dfl_enable")
+        print(f"dflash enabled: block {a.dflash_block}, bits {a.dflash_bits}, {time.time() - t1:.1f} s", flush=True)
     print(f"load {time.time() - t0:.1f} s, tmax {tmax}; prompts {[(k, len(enc[k])) for k in prompts]}", flush=True)
     res = {"rows": [], "prof": {}}
     cfgs = [(c, parse_config(c)) for c in a.configs.split(",")]
@@ -185,6 +201,10 @@ def main():
             eng._ok(lib.ne_fn_mtp_set_moe_dedupe(C.c_void_p(mtp.ptr), cfg["dedupe"]), "set_moe_dedupe")
         if cfg["split"] >= 0:
             eng._ok(lib.ne_fn_mtp_set_moe_split(C.c_void_p(mtp.ptr), cfg["split"]), "set_moe_split")
+        if a.dflash:
+            eng._ok(lib.ne_fn_dfl_set(C.c_void_p(mtp.ptr), cfg["dgate"], cfg["dk"], cfg["dfl"]), "dfl_set")
+        elif cfg["dfl"]:
+            raise SystemExit("config @dfl=1 needs --dflash DIR")
 
     if a.prof:
         names = ["head_step", "head_noreadout", "head_kv_only", "coarse_gemm", "topk_local", "shortlist", "draft_sample",
@@ -223,11 +243,12 @@ def main():
         for t in b[:mm]:
             _, _, _, lg = m.step(t, True, logits=True)
         return mm, (float(lg[b[mm]] - lg[out[mm]]) if lg is not None else None)
+    # configs alternate per prompt (lab-dflash: the GPU's state drifts over a long job; config-major order biased A/Bs)
     for rep in range(a.rounds):
-        for c, cfg in cfgs:
-            apply(cfg)
-            for depth in [int(x) for x in a.depths.split(",")]:
-                for name, (q, n, seed) in prompts.items():
+        for depth in [int(x) for x in a.depths.split(",")]:
+            for name, (q, n, seed) in prompts.items():
+                for c, cfg in cfgs:
+                    apply(cfg)
                     m.set_sampler(*(sp or (1.0, 0.95, 20, seed + rep)))
                     pos = Path(trace).stat().st_size if trace else 0
                     out, s = mtp.generate(enc[name], n, depth, seed=seed + rep)
@@ -239,18 +260,23 @@ def main():
                     rs = trace_rounds(lines)
                     tps = s["tokens"] / (s["decode_ms"] / 1e3)
                     cond, tpr = accept_table(s["hist"])
+                    dr_, dt_ = C.c_int(0), C.c_int(0)
+                    if a.dflash:
+                        lib.ne_fn_dfl_last(C.c_void_p(mtp.ptr), C.byref(dr_), C.byref(dt_))
                     cr = sum(1 for r in rs if r["copy"])
                     ct = sum(r["c"] for r in rs if r["copy"])
                     row = dict(config=c, rep=rep, depth=depth, prompt=name, tps=tps, tokens_per_round=tpr, accept=cond,
                                rounds=s["rounds"], copy_rounds=cr, copy_tokens=ct, draft_ms=s["draft_gpu_ms"],
                                verify_ms=s["verify_gpu_ms"], host_us=s["host_us"], gather_us=s["gather_us"],
-                               n=len(out), out=out, by_depth=round_summary(rs))
+                               n=len(out), out=out, by_depth=round_summary(rs), dfl_rounds=dr_.value,
+                               dfl_tokens=dt_.value)
                     if a.greedy:
                         row["first_mismatch"], row["mismatch_gap"] = mismatch(name, out)
                     res["rows"].append(row)
                     print(f"  {c:10s} d{depth} {name:13s}: {tps:6.1f} tok/s, {tpr:.2f} tok/round, accept "
                           f"{cond[:depth or a.max_depth]}, draft {s['draft_gpu_ms']:.2f} + verify "
                           f"{s['verify_gpu_ms']:.2f} ms/round, copy {cr} rounds / {ct:.0f} tokens"
+                          + (f", dflash {dr_.value} rounds / {dt_.value} tokens" if dr_.value else "")
                           + (f"; vs no-MTP: first mismatch {row['first_mismatch']} (1-row logit gap "
                              f"{row['mismatch_gap']})" if a.greedy else ""), flush=True)
     print("\n== medians over prompts (tok/s)")

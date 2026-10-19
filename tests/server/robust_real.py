@@ -22,7 +22,11 @@ def main():
     ap.add_argument("--key-file", required=True)
     a = ap.parse_args()
     S = Srv(a.url, Path(a.key_file).read_text().strip())
-    base = {"model": "x", "reasoning_effort": "none", "temperature": 0}
+    # the served id, like any real client: a name the server does not serve is a 400 now, not the default (19 Oct)
+    st, m = S.c.req("GET", "/v1/models")
+    MODEL = (m.get("data") or [{}])[0].get("id", "x") if st == 200 else "x"
+    print("served model id: " + MODEL)
+    base = {"model": MODEL, "reasoning_effort": "none", "temperature": 0}
     # 1. an answer, non-streamed and streamed
     t0 = time.perf_counter()
     st, r = S.c.chat(dict(base, max_tokens=60, messages=[{"role": "user", "content": "Name the capital of France in one word."}]))
@@ -37,7 +41,7 @@ def main():
     # 2. a tool call, streamed: closes properly, valid JSON arguments, finish tool_calls
     msgs = [{"role": "system", "content": "You are a helpful assistant. Use tools when they help."},
             {"role": "user", "content": "What's the weather in Paris for the next 3 days? Use the tool."}]
-    chunks = sse_json(S.stream_raw({"model": "x", "tools": TOOLS, "reasoning_effort": "low", "messages": msgs}))
+    chunks = sse_json(S.stream_raw({"model": MODEL, "tools": TOOLS, "reasoning_effort": "low", "messages": msgs}))
     fin = [c["choices"][0]["finish_reason"] for c in chunks if c.get("choices") and c["choices"][0]["finish_reason"]]
     calls = {}
     for c in chunks:
@@ -53,7 +57,7 @@ def main():
     check(fin == ["tool_calls"] and calls and calls[0]["name"] == "get_weather" and isinstance(args, dict)
           and "paris" in str(args.get("city", "")).lower(), f"streamed tool call {calls.get(0)}, finish {fin}")
     # 3. a client leaving mid-reply frees the slot within ~1 s
-    long_q = {"model": "x", "reasoning_effort": "none", "temperature": 0.7, "max_tokens": 3000,
+    long_q = {"model": MODEL, "reasoning_effort": "none", "temperature": 0.7, "max_tokens": 3000,
               "messages": [{"role": "user", "content": "Write a very long, detailed essay about the history of the printing press."}]}
     for stream in (False, True):
         check(S.wait_idle(20) is not None, "idle before")

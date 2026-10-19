@@ -8,7 +8,8 @@ Error bars: KLD = 95% bootstrap CI of the mean over the set's windows (per-windo
 bootstrap CI of the mean over 6 prompts x 3 seeds; prefill = median with min-max over 5 cold runs. Speed numbers are the
 18 Oct same-client runs (the head-to-head harness, not in this repository: one streaming client, same prompts and seeds,
 each engine on its own pack and best settings). Ijah vs oMLX (Jundot oQ4e) and Sushi (its own Sushi-4bpw pack). The
-DFlash2 drafter marker is a 19 Oct lab build, not part of this release (see the hollow-marker footnotes).
+DFlash2 drafter point (120.4 tok/s) is the opt-in `--drafter dflash2` path, measured 19 Oct; that build's MTP-only
+baseline was 112.4, so it is read against that and not against the 18 Oct 98.9 bar.
 """
 import json
 import math
@@ -42,7 +43,7 @@ SHORT = {"Ijah": "5b · 6/8b", "oMLX": "oQ4e 4.72b", "Sushi": "4b · 8b"}
 SPEED = {
     "Decode with MTP (tok/s)": {
         "Ijah":  (98.9, "T6 pack, MTP depth 2 (--seed-mtp), SD 10.2, range 83-119; with 4-bit experts 105.2; "
-                        "with the DFlash2 drafter 120.4 (19 Oct lab build, not in this release)", (94.4, 103.6)),
+                        "with the opt-in DFlash2 drafter 120.4 (19 Oct, that build's MTP baseline 112.4)", (94.4, 103.6)),
         "oMLX":  (105.2, "Jundot oQ4e, tuned settings (MTP depth 2, INT8 prefill); SD 9.2, range 91-120", (100.9, 109.2)),
         "Sushi": (85.8, "Sushi-4bpw, its own best settings (MTP on); SD 12.1, range 67-108; paired Ijah/Sushi "
                         "1.162 (CI 1.122-1.203), 18/18 wins", (80.4, 91.1)),
@@ -193,8 +194,8 @@ def speed_chart():
             "INT8-activation prefill).",
             "Engine + weights, not engine alone: Sushi ran its 4-bit-expert Sushi-4bpw pack, oMLX the 4.72 bpw oQ4e, "
             "Ijah its 5-bit-expert T6 pack.",
-            "18 Oct 2026, M5 Max 128 GB. Ijah with the DFlash2 drafter measured 120.4 tok/s on a 19 Oct lab build "
-            "(not in this release).")):
+            "18 Oct 2026, M5 Max 128 GB. With the opt-in DFlash2 drafter Ijah measured 120.4 tok/s (19 Oct, on a build "
+            "whose MTP-only baseline was 112.4).")):
         out.append(f'<text class="t3" x="40" y="{H - 124 + 17 * k}" font-size="11.5">{esc(line)}</text>')
     out.append("</svg>")
     return "\n".join(out)
@@ -301,20 +302,21 @@ def tradeoff_chart(st):
                f'[{b4[100]:.4f}, {b4[3899]:.4f}] (Sushi-4bpw expert shards + Ijah\'s T6 trunk)</title></circle>')
     out.append(f'<text class="t1" x="{cx - 12:.1f}" y="{cy + 22:.1f}" font-size="13" text-anchor="end" {halo}>'
                f'Ijah, 4-bit experts (experiment)</text>')
-    # Ijah + the DFlash2 block drafter (same T6 pack, so the same quality): hollow marker, same colour
+    # Ijah + the DFlash2 block drafter (opt-in --drafter dflash2; same T6 pack, so the same quality)
     cx, cy = X(120.4), Y(st["Ijah"]["B"][0])
     out.append(hwhisker(X(116.9), X(123.8), cy, cap=5))
-    out.append(f'<circle class="s-Ijah" cx="{cx:.1f}" cy="{cy:.1f}" r="9" fill="none" stroke-width="3" '
-               f'stroke-dasharray="3 3"><title>Ijah with the DFlash2 drafter: 120.4 tok/s (95% CI 116.9-123.8), same T6 '
-               f'pack so the same KLD {st["Ijah"]["B"][0]:.4f}; 19 Oct lab build, not in this release</title></circle>')
+    out.append(f'<circle class="c-Ijah gap" cx="{cx:.1f}" cy="{cy:.1f}" r="9" stroke-width="2">'
+               f'<title>Ijah with the DFlash2 drafter (--drafter dflash2, off by default): 120.4 tok/s (95% CI '
+               f'116.9-123.8, derived from the paired ratios), same T6 pack so the same KLD {st["Ijah"]["B"][0]:.4f}; '
+               f'measured 19 Oct on a build whose MTP-only baseline was 112.4 tok/s</title></circle>')
     out.append(f'<text class="t1" x="{cx - 12:.1f}" y="{cy + 40:.1f}" font-size="13" text-anchor="end" {halo}>'
-               f'Ijah + DFlash2 drafter (lab build)</text>')
+               f'Ijah + DFlash2 drafter (opt-in)</text>')
     out.append(f'<text class="t3" x="40" y="{H - 52}" font-size="11.5">Whiskers: decode 95% CI over 6 prompts x 3 seeds '
                f'(same client); KLD 95% bootstrap CI over windows.</text>')
-    out.append(f'<text class="t3" x="40" y="{H - 35}" font-size="11.5">Hollow markers are lab work, not this release: '
-               f'4-bit experts (not a published pack) and the DFlash2 drafter (not in this tree).</text>')
-    out.append(f'<text class="t3" x="40" y="{H - 18}" font-size="11.5">The DFlash2 point is a 19 Oct build, whose MTP-only '
-               f'baseline was 112.4 tok/s: read it against that, not against the 98.9 bar.</text>')
+    out.append(f'<text class="t3" x="40" y="{H - 35}" font-size="11.5">Hollow marker: an experiment with 4-bit experts '
+               f'(not a published pack); the published Ijah pack uses 5-bit experts.</text>')
+    out.append(f'<text class="t3" x="40" y="{H - 18}" font-size="11.5">The DFlash2 point is a 19 Oct measurement on a '
+               f'build whose MTP-only baseline was 112.4 tok/s: read it against that, not against 98.9.</text>')
     out.append("</svg>")
     return "\n".join(out)
 

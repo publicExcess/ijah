@@ -933,3 +933,31 @@ branch's `build/libengine.dylib`, 17 Oct 12:21; results `tests/server/results/ro
 streamed answers, a streamed tool call (`get_weather {"city": "Paris", "days": 3}`, `finish_reason` `tool_calls`), a client
 leaving mid-generation: slot free after **0.10 s** (non-streamed) and **0.05 s** (streamed), a client leaving during a
 17K-token prefill: free after **0.3 s**, the next identical request reused the 4096 tokens already fed. 11 of 11 checks.
+
+## 13. A request naming a model this server does not serve (lab-dflash, 19 Oct 2026)
+
+`App.model_for(name)` picks the model a request names: exact id, else case-insensitive, no name = the default. Until
+today an **unknown** name was an error only when several models were served; with one model served it was answered by
+the default model, HTTP 200. That leniency cost a day of measurement credibility:
+
+- `~/.pi/agent/models.json` registered `Swift-1.5-Flash-Next-native-dflash` (a drafter id) against `127.0.0.1:8140`.
+  The server on :8140 was the master build serving `Swift-1.5-Flash-Next-native`, and the master lib has **0** `dfl`
+  symbols (`nm -gU`) - the drafter was not even compiled in.
+- Every pi request naming the drafter id got **200** from the plain MTP path: `{"model": "Swift-1.5-Flash-Next-native",
+  "timings": {"path": "mtp"}}`. Nothing - status code, body, pi's `PI_MODEL`, a chat that answered coherently - said so.
+  `PI_MODEL` records what the *client asked for*, never what the server used.
+- Consequence: a "DFlash" benchmark run on that server would have measured the control arm under the drafter's label.
+  The +6% figure itself is safe (it came from `bench_draft`/`session.sh` on a drafter build), but every number produced
+  through pi before this fix is void.
+
+**Now:** an unknown name is a 400 whose message lists the served ids, in the single-model case too. Ask for the drafter
+id on a plain server and you get `unknown model 'Swift-1.5-Flash-Next-native-dflash'; this server has
+Swift-1.5-Flash-Next-native`, and the reverse (a plain id on a drafter server) too - a drafter run cannot quietly be a
+control, which is the property the measurement needed. `GET /v1/models` is the authoritative list; clients should read
+their own id from it (`tests/server/test_client.py:134`, and `tests/server/robust_real.py`, which sent `"model": "x"`).
+
+`--allow-any-model` restores the old behaviour for a **single-model** server only (a placeholder name gets the default,
+warned once per name in serve.log); it exists for the suites that send `"model": "x"` (`run_mock.sh`'s robust-http and
+scheduler launches) and for legacy clients. It never applies when several models are served - there the name is the
+only thing deciding which model answers. Tests: `tests/server/test_model_id.py` (13 checks, no engine, no GPU, no
+port; runs in `run_mock.sh`). Related: docs/mtp.md 13.7.

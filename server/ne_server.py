@@ -441,6 +441,7 @@ class App:
                 log(f"model {mid}: {len(backs)} slot(s) ready ({time.perf_counter() - t0:.1f} s)")
         d = next(iter(self.models.values()))
         self.default = d
+        self._lenient_seen = set()   # names --allow-any-model answered for (warn once per name)
         allb = [sl.b for m in self.models.values() for sl in m.session.slots]
         if not a.mock and len(allb) > 1 and os.environ.get("NE_SRV_SHARE_PF", "1") != "0":
             # every model instance (slots, models) prefills on the engine thread, one call at a time: one set of chunk
@@ -475,15 +476,24 @@ class App:
         return late
 
     def model_for(self, name):
-        """the Served model a request names: exact id, else case-insensitive; no name -> the default. An unknown
-        name is an error when several models are served (one model: ignored, as before)."""
+        """the Served model a request names: exact id, else case-insensitive; no name -> the default. An unknown name
+        is a 400 listing the served ids - also when a single model is served (was: silently answered by the default,
+        19 Oct). That leniency made a drafter measurement untrustworthy: pi asked for
+        Swift-1.5-Flash-Next-native-dflash while the server served Swift-1.5-Flash-Next-native, got HTTP 200 from the
+        plain MTP path, and nothing anywhere said so (docs/server.md 13, docs/mtp.md 13.7). A client that sends a
+        placeholder name on a single-model server (the old tests/server behaviour, "model": "x") opts in with
+        --allow-any-model; it warns once per name. Tests: tests/server/test_model_id.py."""
         if not name:
             return self.default
         m = self.models.get(name)
         if m is None:
             m = next((x for k, x in self.models.items() if k.lower() == str(name).lower()), None)
         if m is None:
-            if len(self.models) == 1:
+            if getattr(self.a, "allow_any_model", False) and len(self.models) == 1:
+                if str(name) not in self._lenient_seen:
+                    self._lenient_seen.add(str(name))
+                    log(f"model {str(name)!r} is not served: --allow-any-model -> answering {self.default.id} "
+                        f"(one warning per name)")
                 return self.default
             raise chat.RequestError(f"unknown model {name!r}; this server has {', '.join(self.models)}")
         return m
@@ -1275,13 +1285,27 @@ def main():
     ap.add_argument("--no-grammar", action="store_true", help="no structured output (response_format, forced tools)")
     ap.add_argument("--seed-mtp", action="store_true", help="a request with a seed may take the MTP path (default: "
                     "seeded requests step, which reproduces for a seed; MTP rounds are only best effort)")
+    ap.add_argument("--allow-any-model", action="store_true", help="answer a request that names a model this server "
+                    "does not serve with the default model, on a single-model server (the behaviour before 19 Oct; "
+                    "tests/server sends \"model\": \"x\"). Off by default: an unknown id is a 400, so a drafter/plain "
+                    "mismatch cannot be measured as a match (docs/server.md 13)")
     ap.add_argument("--prefill-int8", action="store_true", help="opt-in: int8 activations for the T6 trunk Linears in "
                     "prefill (in >= 1024; NE_T6_A8=128): ~+3-4%% cold prefill, KLD A n.s. / B +2%% (CI touches 0) / C "
                     "better (docs/prefill.md 4f); off by default to keep quality")
+    ap.add_argument("--drafter", default="mtp", choices=["mtp", "dflash2"], help="lab-dflash: dflash2 = the DFlash2 "
+                    "block drafter drafts MTP rounds (its q-gated verify picks 1 .. kmax drafts; the MTP head when its "
+                    "context is short; docs/mtp.md 13). Default mtp (the native head)")
+    ap.add_argument("--drafter-path", default=str(Path.home() / "Models/drafters/Qwen3.8-Flash-Next-DFlash2"),
+                    help="the DFlash2 checkpoint (config.json + model.safetensors)")
+    ap.add_argument("--dflash-kmax", type=int, default=5, help="most drafts a DFlash2 round verifies (<= 5 in this build: verify runs at kmax + 1 rows and the kernels are instantiated to 6; kmax 6-7 is built and measured in development only)")
+    ap.add_argument("--dflash-bits", type=int, default=8, choices=[8, 4], help="drafter weight bits")
     ap.add_argument("--mock", action="store_true", help="CPU mock engine (tests)")
     ap.add_argument("--mock-delay", type=float, default=0.0, help="mock seconds per token")
     ap.add_argument("--mock-prefill-rate", type=float, default=0.0, help="mock prefill tokens per second (0 = instant)")
     a = ap.parse_args()
+    if a.drafter != "mtp":  # lab-dflash: RealBackend reads these when it creates the MTP loop
+        os.environ.update(NE_DRAFTER=a.drafter, NE_DRAFTER_PATH=a.drafter_path, NE_DFL_KMAX=str(a.dflash_kmax),
+                          NE_DFL_BITS=str(a.dflash_bits))
     if a.prefill_int8:   # read by the engine library (kernels/trunk6) when the model loads, so set before loading
         os.environ.setdefault("NE_T6_A8", "128")
     if os.environ.get("NE_T6_A8", "0") not in ("", "0"):

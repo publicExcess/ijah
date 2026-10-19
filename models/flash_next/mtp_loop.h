@@ -34,6 +34,7 @@ struct MtpStats {
   double gather_us = 0, host_us = 0;                          // sums: n-gram gather, accept + bookkeeping
   double flush_ms = 0;  // wall: the end-of-run commit of the last round's lazy rows (one 2-row verify)
   int copy_rounds = 0, copy_tokens = 0;  // lab-draft: rounds drafted by the copy rule, tokens they emitted
+  int dfl_rounds = 0, dfl_tokens = 0;    // lab-dflash: rounds drafted by the DFlash2 block drafter, tokens emitted
   std::vector<int> hist;  // [(max_depth + 1) * (max_depth + 1)]: rounds at depth d with a accepted (d * (M+1) + a)
 };
 // Prompt (prefill()'s policy: chunked from 16 tokens; layer 47's hidden of every position feeds the head's prefill)
@@ -97,6 +98,30 @@ NE_API int ne_fn_mtp_set_copy(ne_fn_mtp *p, int min_match, int depth);
 NE_API int ne_fn_mtp_set_draft_vocab(ne_fn_mtp *p, const char *mode);
 // lab-draft: the gated verify (NE_MTP_QGATE; sampled drafts at a fixed depth: verify the drafts' best prefix), 0 / 1
 NE_API int ne_fn_mtp_set_qgate(ne_fn_mtp *p, int on);
+// lab-dflash step A (docs/mtp.md 13): host-driven rounds for an external drafter. capture = the DFlash2 target
+// features (4-stream mean of layers 5 / 15 / 25 / 35 / 45) in every verify (re-records); reset = empty model;
+// verify R rows at T: topk f32 [R][20][2] (id bits, logit), feat f32 [R][12800], gpu ms; commit c rows of it.
+NE_API int ne_fn_dfl_capture(ne_fn_mtp *p, int on);
+NE_API int ne_fn_dfl_reset(ne_fn_mtp *p);
+NE_API int ne_fn_dfl_verify(ne_fn_mtp *p, const int *toks, int R, float *topk, float *feat, double *gpu_ms);
+NE_API int ne_fn_dfl_commit(ne_fn_mtp *p, const int *toks, int c);
+// lab-dflash step B (docs/mtp.md 13): the DFlash2 block drafter in the MTP loop (default off). enable: dir = the
+// checkpoint (config.json + model.safetensors), block rows B (8 = the trained block; 4 = the card's serving size),
+// kmax = most drafts a round verifies (<= B - 1 and <= the loop's max depth), drafter weights at bits 8 / 4, gate 1 =
+// sampled rounds verify the prefix 1 .. kmax that the drafts' proposal probabilities say pays for its verify rows.
+// Rounds then draft with the block drafter whenever its context reaches the current position (fresh prompts, feeds,
+// steps, MTP runs keep it in step), else with the MTP head; the copy rule keeps priority. set: gate (-1 = keep),
+// kmax (0 = keep), active (-1 = keep; 0 = no block drafts and no context upkeep, for A/B). last: the last run's DFlash rounds / tokens.
+NE_API int ne_fn_dfl_enable(ne_fn_mtp *p, const char *dir, int block, int kmax, int bits, int gate);
+NE_API int ne_fn_dfl_set(ne_fn_mtp *p, int gate, int kmax, int active);  // -1 / 0 = keep
+NE_API int ne_fn_dfl_on(ne_fn_mtp *p);
+NE_API int ne_fn_dfl_last(ne_fn_mtp *p, int *rounds, int *tokens);
+// checks: the drafter's context from host feature rows f32 [n][12800] at positions [pos, pos + n); one block draft at
+// the context's end with its internals (hn [B - 1][2560], sl / qo [B - 1][16][2], drafts [B - 1], GPU ms).
+NE_API int ne_fn_dfl_ctx_reset(ne_fn_mtp *p, int T);
+NE_API int ne_fn_dfl_ctx_push(ne_fn_mtp *p, int pos, const float *feat, int n);
+NE_API int ne_fn_dfl_probe(ne_fn_mtp *p, int anchor, int sampled, float temp, uint32_t seed, float *hn, float *sl,
+                           int *drafts, float *qo, double *ms);
 // lab-verify: routed experts read once per verify for all rows routed to them (1 = at every R, N >= 2 = at R <= N)
 // or per (row, slot) pair (0) = g_moe_dedupe; re-records the verifies.
 NE_API int ne_fn_mtp_set_moe_dedupe(ne_fn_mtp *p, int on);

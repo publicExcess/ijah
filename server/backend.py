@@ -161,9 +161,27 @@ class RealBackend:
             L.ne_fn_mtp_generate.restype = C.c_int
             L.ne_fn_mtp_generate.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_int, C.c_uint64,
                                              C.c_void_p, C.c_void_p, C.c_void_p]
-            self.mtp_ptr = L.ne_fn_mtp_create(C.c_void_p(self.m.ptr), max(4, mtp_depth), 4)
+            # lab-dflash (docs/mtp.md 13): the DFlash2 block drafter (ne_server --drafter dflash2 --drafter-path DIR)
+            drafter = os.environ.get("NE_DRAFTER", "mtp")
+            if drafter not in ("mtp", "dflash2"):
+                raise E.EngineError(f"NE_DRAFTER={drafter}: mtp or dflash2")
+            dkmax = int(os.environ.get("NE_DFL_KMAX", "5")) if drafter == "dflash2" else 0
+            self.mtp_ptr = L.ne_fn_mtp_create(C.c_void_p(self.m.ptr), max(4, mtp_depth, dkmax), 4)
             if not self.mtp_ptr:
                 raise E.EngineError(f"ne_fn_mtp_create: {self.eng.last_error()}")
+            self.drafter = "mtp"
+            if drafter == "dflash2":
+                dpath = os.environ.get("NE_DRAFTER_PATH", "")
+                if not dpath or not self.eng.has("ne_fn_dfl_enable"):
+                    raise E.EngineError("--drafter dflash2 needs --drafter-path DIR and a libengine with ne_fn_dfl_enable")
+                f = self.eng.fn("ne_fn_dfl_enable", C.c_int, [C.c_void_p, C.c_char_p, C.c_int, C.c_int, C.c_int, C.c_int])
+                t1 = time.time()
+                if f(C.c_void_p(self.mtp_ptr), dpath.encode(), int(os.environ.get("NE_DFL_BLOCK", "8")), dkmax,
+                     int(os.environ.get("NE_DFL_BITS", "8")), int(os.environ.get("NE_DFL_GATE", "1"))):
+                    raise E.EngineError(f"ne_fn_dfl_enable: {self.eng.last_error()}")
+                self.drafter = "dflash2"
+                log(f"DFlash2 drafter: {dpath} (block {os.environ.get('NE_DFL_BLOCK', '8')}, kmax {dkmax}, "
+                    f"{os.environ.get('NE_DFL_BITS', '8')}-bit; {time.time() - t1:.1f} s)")
         # MTP from the current state (lab-mtpcont, docs/mtp.md 10.9): feeds / steps keep the MTP head in step
         self.mtp_cont = bool(self.mtp_ptr) and self.eng.has("ne_fn_mtp_generate_from")
         self.mtp_abortable = bool(self.mtp_ptr) and self.eng.has("ne_fn_mtp_generate_cb")

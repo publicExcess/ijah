@@ -2,6 +2,7 @@
 #include "models/flash_next/mtp_loop.h"
 
 #include "kernels/fn_rec.h"
+#include "models/flash_next/dflash.h"
 #include "models/flash_next/prefill.h"
 
 #include <algorithm>
@@ -83,7 +84,34 @@ struct MtpLoop {
   // 0.1, EMAs over every round), rate = tokens per ms (EMAs), vcost[R] = ms of a round's verify + host at R rows.
   bool qgate = false;
   double qacc[10], qrc = 2.4, qrm = 22.0, vcost[9];
+  // lab-dflash (docs/mtp.md 13): DFlash2 target features in every verify: the 4-stream mean of layers kDflLayers'
+  // outputs -> feat f32 [8][5 * 2560] (row j = verify row j)
+  bool dfl_cap = false;
+  Tensor feat;
+  // lab-dflash: the DFlash2 block drafter (dfl_enable; docs/mtp.md 13). Its context = target positions [c.T - c.n, c.T)
+  // in the rings; then (in order) vcnt rows of the last verify (feat rows 0 .. vcnt - 1, positions c.T ..) and fsn rows
+  // of the feature ring fs (positions [fsT - fsn, fsT): prefill chunks write it on the GPU, steps on the host) not
+  // yet added. Valid while gen == Model::gen (as the head).
+  struct Dfl {
+    dfl::Weights w;
+    dfl::Ctx c;
+    dfl::Scratch s;                        // block rows B
+    std::unique_ptr<Recorder> draft;       // the vcnt verify rows -> context, then the block (drafts -> vtok)
+    std::unique_ptr<Recorder> cfeat;       // the vcnt verify rows -> context alone (copy / MTP-head rounds, end of run)
+    std::unique_ptr<Recorder> rebuild;     // key / value rings from the c ring (after a restore)
+    std::map<int, std::unique_ptr<Recorder>> drain;  // fs rows -> context, by 16-row groups
+    Tensor fs, stage;                      // f32 [2048][12800] by position % 2048; f32 [16][12800]
+    int fsT = 0, fsn = 0, vcnt = 0;
+    uint64_t gen = ~0ull;
+    int B = 8, kmax = 5, kgreedy = 3, minctx = 512;
+    bool gate = true, active = true, early_a = true;  // early_a: NE_DFL_EARLY_A (A behind the draft, see the round)  // active = 0: no block drafts and no context upkeep (A/B in one process)
+    double qacc[10], qaccg[10], rc = 3.0, rm = 25.0, vcost[9], vcostg[9];  // (..g: greedy rounds)
+    double qacc0[10], vcost0[9];  // the priors: every run starts from them (runs repeat exactly, as DepthPolicy's)
+  };
+  std::unique_ptr<Dfl> dfl;
+  int last_dfl_rounds = 0, last_dfl_tokens = 0;
 };
+
 void MtpLoopDeleter::operator()(MtpLoop *p) const {
   if (p && p->trace) fclose(p->trace);
   if (p && p->rdump) fclose(p->rdump);
@@ -183,6 +211,8 @@ MtpLoopPtr mtp_create(Model &m, int max_depth, int draft_bits, int shortlist) {
   L->qb = alloc(DType::F32, {16, 32, 2});
   L->dsp = alloc(DType::U32, {8});
   L->xind = alloc(DType::U32, {4});
+  L->feat = alloc(DType::F32, {RM, 5 * HID});
+  if (const char *e = getenv("NE_DFL_CAPTURE")) L->dfl_cap = atoi(e) > 0;
   for (auto &w : m.L) L->ex.push_back(w.linear ? nax::alloc_layer_extra(0, true, &L->keep) : nax::alloc_layer_extra());
   L->mixer = m.mixer;
   L->mixer.inject = m.dummy_inj;
@@ -233,6 +263,11 @@ MtpLoopPtr mtp_create(Model &m, int max_depth, int draft_bits, int shortlist) {
 
 // lab-verify: NE_VERIFY_ROUTES debug capture of layer l's routing (s.route [R][20] is rewritten by the next layer's router)
 static void route_cap(MtpLoop &L, Recorder &r, Scratch &s, int l) {
+  if (L.dfl_cap && dfl_slot(l) >= 0) {  // lab-dflash: layer l's output = hv[(l + 1) % 2]
+    r.dispatch(pso("dfl_hc_mean"), {L.hv[(l + 1) % 2], L.feat, Arg::value(U4{(uint32_t)s.rows, (uint32_t)dfl_slot(l), 0, 0})},
+               sz(s.rows * 10), sz(256));
+    r.barrier();
+  }
   if (!L.rdump) return;
   const uint32_t n = (uint32_t)s.rows * 20u, off = (uint32_t)l * 8u * 20u;
   r.dispatch(pso("mtp_copy_u32", 32), {s.route, L.rcap, Arg::value(U4{0, off, n, 0})}, sz(1), sz(256));
@@ -333,6 +368,151 @@ static Recorder &get_draft(MtpLoop &L, int n, int D, bool sampled) {
   r.barrier();
   r.end();
   return r;
+}
+
+
+// ---- lab-dflash: the DFlash2 drafter's context (docs/mtp.md 13)
+static bool dfl_on(const MtpLoop &L) { return L.dfl && L.dfl->active; }
+static void dfl_reset(MtpLoop &L, int T) {
+  if (!L.dfl) return;
+  MtpLoop::Dfl &d = *L.dfl;
+  d.c.T = T;
+  d.c.n = 0;
+  d.fsT = T;
+  d.fsn = 0;
+  d.vcnt = 0;
+  d.gen = L.m->gen;
+}
+// n feature rows at positions [pos, pos + n) are in the fs ring (the prefill wrote the last <= 2048 on the GPU, or
+// dfl_push); a row that does not continue the known ones starts the context over at pos
+static void dfl_note(MtpLoop &L, int pos, int n) {
+  MtpLoop::Dfl &d = *L.dfl;
+  NE_CHECK(d.vcnt == 0, "dflash: verify rows pending before new feature rows");
+  if (pos != d.fsT) {
+    d.c.n = 0;
+    d.c.T = pos;
+    d.fsn = 0;
+  }
+  d.fsT = pos + n;
+  d.fsn = std::min(dfl::W, d.fsn + n);
+}
+static void dfl_push(MtpLoop &L, int pos, const float *rows, int n) {
+  MtpLoop::Dfl &d = *L.dfl;
+  for (int i = 0; i < n; i++)
+    memcpy((float *)d.fs.host() + (size_t)((pos + i) % dfl::W) * dfl::FEAT, rows + (size_t)i * dfl::FEAT,
+           (size_t)dfl::FEAT * 4);
+  dfl_note(L, pos, n);
+}
+static Recorder &dfl_drain_rec(MtpLoop &L, int G) {
+  MtpLoop::Dfl &d = *L.dfl;
+  auto &p = d.drain[G];
+  if (p) return *p;
+  p = std::make_unique<Recorder>();
+  Recorder &r = *p;
+  r.begin();
+  for (int i = 0; i < G; i++) {
+    r.dispatch(pso("dfl_fs_gather"), {d.fs, d.stage, d.s.P, Arg::value((uint32_t)(16 * i))},
+               sz(16 * dfl::FEAT / 256), sz(256));
+    r.barrier();
+    dfl::record_ctx_rows(r, d.w, d.c, d.s, d.stage, 16, (uint32_t)(16 * i));
+  }
+  r.end();
+  return r;
+}
+// the fs rows into the context (16-row groups, the group count rounded up to a power of 2; extra rows skip)
+static void dfl_drain(MtpLoop &L) {
+  MtpLoop::Dfl &d = *L.dfl;
+  if (d.fsn == 0) return;
+  NE_CHECK(d.vcnt == 0, "dflash: verify rows pending at a drain");
+  if (d.fsT - d.fsn != d.c.T) {  // rows dropped from the ring (more than 2048 since the last drain)
+    d.c.n = 0;
+    d.c.T = d.fsT - d.fsn;
+  }
+  int G = 1;
+  while (G * 16 < d.fsn) G *= 2;
+  uint32_t *P = u32(d.s.P);
+  P[1] = (uint32_t)d.fsn;
+  P[2] = (uint32_t)d.c.T;
+  dfl_drain_rec(L, G).run();
+  d.c.T += d.fsn;
+  d.c.n = std::min(dfl::W, d.c.n + d.fsn);
+  d.fsn = 0;
+}
+// the last verify's committed rows (feat rows 0 .. vcnt - 1) into the context: its own command buffer, queued before
+// the next verify (rounds that run no block draft, the end of a run)
+static void dfl_flush_v(MtpLoop &L, bool wait) {
+  MtpLoop::Dfl &d = *L.dfl;
+  if (d.vcnt == 0) return;
+  if (d.cfeat->in_flight()) d.cfeat->wait();
+  uint32_t *P = u32(d.s.P);
+  P[1] = (uint32_t)d.vcnt;
+  P[2] = (uint32_t)d.c.T;
+  d.cfeat->commit();
+  if (wait) d.cfeat->wait();
+  d.c.T += d.vcnt;
+  d.c.n = std::min(dfl::W, d.c.n + d.vcnt);
+  d.vcnt = 0;
+}
+// a block draft can run at T: the context reaches T (after the pending verify rows) with enough rows behind it
+static bool dfl_usable(MtpLoop &L, int T) {
+  if (!L.dfl) return false;
+  const MtpLoop::Dfl &d = *L.dfl;
+  return d.fsn == 0 && d.c.T + d.vcnt == T && d.c.n + d.vcnt >= std::min(T, d.minctx);
+}
+// checkpoints (state_io, snapshots): header int64 [4] = (valid, T, n, 0) + the c ring bf16 [2048][2560]
+static constexpr int64_t kDflStateBytes = 32 + (int64_t)dfl::W * dfl::H * 2;
+static void dfl_export(MtpLoop &L, void *buf) {
+  int64_t *h = (int64_t *)buf;
+  memset(h, 0, 32);
+  if (!dfl_on(L) || L.dfl->gen != L.m->gen || L.m->dirty) return;  // not in step: the importer restarts the context
+  MtpLoop::Dfl &d = *L.dfl;
+  dfl_drain(L);
+  if (d.vcnt) return;
+  h[0] = 1;
+  h[1] = d.c.T;
+  h[2] = d.c.n;
+  memcpy((char *)buf + 32, d.c.cr.host(), (size_t)dfl::W * dfl::H * 2);
+}
+static Recorder &dfl_rebuild_rec(MtpLoop &L) {
+  MtpLoop::Dfl &d = *L.dfl;
+  if (!d.rebuild) {
+    d.rebuild = std::make_unique<Recorder>();
+    d.rebuild->begin();
+    dfl::record_rebuild(*d.rebuild, d.w, d.c, d.s);
+    d.rebuild->end();
+  }
+  return *d.rebuild;
+}
+// after the model's state import (Model::gen bumped): the drafter's context from buf, or restarted at T
+static void dfl_import(MtpLoop &L, const void *buf) {
+  if (!L.dfl) return;
+  const int64_t *h = (const int64_t *)buf;
+  if (!h || h[0] != 1 || h[1] != L.m->T || h[2] < 0 || h[2] > dfl::W || h[2] > h[1]) {
+    dfl_reset(L, L.m->T);
+    return;
+  }
+  MtpLoop::Dfl &d = *L.dfl;
+  dfl_reset(L, (int)h[1]);
+  memcpy(d.c.cr.host(), (const char *)buf + 32, (size_t)dfl::W * dfl::H * 2);
+  d.c.n = (int)h[2];
+  if (d.c.n > 0) {
+    uint32_t *P = u32(d.s.P);
+    P[1] = (uint32_t)d.c.n;
+    P[2] = (uint32_t)(d.c.T - d.c.n);
+    dfl_rebuild_rec(L).run();
+  }
+}
+static int dfl_gate_depth(const MtpLoop::Dfl &d, const float *qd, int K, bool greedy) {
+  int best = 1;
+  double bv = -1.0, run = 1.0, e = 1.0;
+  const double *acc = greedy ? d.qaccg : d.qacc, *vc = greedy ? d.vcostg : d.vcost;
+  for (int k = 1; k <= K; k++) {
+    run *= acc[qbin(qd[k - 1])];
+    e += run;
+    const double v = e / vc[k + 1];
+    if (v > bv) { bv = v; best = k; }
+  }
+  return best;
 }
 
 // ---- head state kept in step with the model (MTP from the current state; docs/mtp.md 10.9)
@@ -440,7 +620,9 @@ static void feed_body(MtpLoop &L, const int *toks, int n, bool chunk_policy, con
       // the next chunk's n-gram rows are gathered while this one runs (within the call: prefill_tokens' own
       // overlap; the call's last chunk: the caller's `ahead`, the next call's first tokens)
       const bool last = i + cn >= n;
+      if (dfl_on(L)) prefill_set_dfl(pf, &L.dfl->fs);  // (a shared Prefill may have been swapped in: lab-srvperf)
       prefill_tokens(pf, toks + i, cn, last ? ahead : toks + i + cn, last ? n_ahead : n - i - cn);
+      if (dfl_on(L)) dfl_note(L, m.T - cn, cn);
       const auto f1 = clk::now();
       int r0 = 0;
       if (hchunk) {
@@ -477,11 +659,13 @@ static void feed_body(MtpLoop &L, const int *toks, int n, bool chunk_policy, con
   if (m.rec_a4)
     for (; i + 4 <= n; i += 4) {
       step4(m, toks + i);
+      if (dfl_on(L)) dfl_push(L, m.T - 4, (const float *)m.dfl_f.host(), 4);
       for (int r = 0; r < 4; r++) head_pend(L, (const float *)hlast4.host() + (size_t)r * HCD, nxt(i + r));
       head_lazy(L);
     }
   for (; i < n; i++) {
     step(m, toks[i], false);
+    if (dfl_on(L)) dfl_push(L, m.T - 1, (const float *)m.dfl_f.host(), 1);
     head_pend(L, (const float *)hlast.host(), nxt(i));
     head_lazy(L);
   }
@@ -495,8 +679,13 @@ void mtp_feed(MtpLoop &L, const int *toks, int n, const int *ahead, int n_ahead)
   NE_CHECK(htmax == 0 || L.m->T + n <= htmax, "mtp_feed: the MTP head's context is full (%d + %d > %d)", L.m->T, n, htmax);
   NE_CHECK(mtp_head_ok(L), "mtp_feed: the MTP head is not in step with the model (plain step / prefill / restore "
                            "since its last MTP call): reset or restore an MTP snapshot");
+  if (dfl_on(L) && L.dfl->gen != L.m->gen) dfl_reset(L, L.m->T);
   feed_body(L, toks, n, use_chunked(*L.m, n), ahead, n_ahead);
   L.head_gen = L.m->gen;
+  if (dfl_on(L)) {
+    dfl_drain(L);
+    L.dfl->gen = L.m->gen;
+  }
 }
 
 StepOut mtp_step(MtpLoop &L, int tok, bool head) {
@@ -504,10 +693,15 @@ StepOut mtp_step(MtpLoop &L, int tok, bool head) {
   NE_CHECK(mtp_head_ok(L), "mtp_step: the MTP head is not in step with the model");
   head_next(L, tok);
   ctx_add(L, m.T, &tok, 1);
+  if (dfl_on(L) && L.dfl->gen != m.gen) dfl_reset(L, m.T);
   StepOut o = step(m, tok, head);
   head_pend(L, (const float *)m.h[m.L.size() % 2].host(), -1);
   head_lazy(L);
   L.head_gen = m.gen;
+  if (dfl_on(L)) {
+    dfl_push(L, m.T - 1, (const float *)m.dfl_f.host(), 1);
+    L.dfl->gen = m.gen;
+  }
   return o;
 }
 
@@ -570,6 +764,14 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
   NE_CHECK(m.T + n + 1 <= m.tmax, "context full (%d + %d of %d)", m.T, n, m.tmax);
   u32(L.keep)[0] = 0;
   L.head_ms = 0;
+  if (dfl_on(L) && L.dfl->gen != m.gen) dfl_reset(L, m.T);  // (a fresh run: T = 0; a stale context: from T on)
+  if (dfl_on(L)) {  // the gate's calibration starts from the priors in every run (a run's rounds depend on it only)
+    MtpLoop::Dfl &d = *L.dfl;
+    memcpy(d.qacc, d.qacc0, sizeof d.qacc);
+    memcpy(d.qaccg, d.qacc0, sizeof d.qaccg);
+    memcpy(d.vcost, d.vcost0, sizeof d.vcost);
+    memcpy(d.vcostg, d.vcost0, sizeof d.vcostg);
+  }
 
   // ---- prefill: the target over prompt[0, n - 1) (chunked prefill from 16 tokens, else 4-row chunks + 1-row steps);
   // layer 47's pre-mixer hidden of every position feeds the head over the (H_j, x_{j+1}) pairs in 8-row steps as they
@@ -582,10 +784,12 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
   StepOut o = step(m, prompt[n - 1], true);
   gdn_materialise(m.st);  // lab-gdnlazy: the verify's lazy-commit kernels read ssm (the last prompt step deferred)
   head_pend(L, (const float *)hlast.host(), o.token);
+  if (dfl_on(L)) dfl_push(L, m.T - 1, (const float *)m.dfl_f.host(), 1);
   // lab-ttft: stream the first token before the head's catch-up (the drafts of round 0 need it, the token does not)
   out[0] = o.token;
   const bool cb_stop = cb && cb(cb_ctx, out, 1);
   head_drain(L, true, 1);  // every pair but the seed (H_{T-1}, t1) into the head's KV
+  if (dfl_on(L)) dfl_drain(L);  // lab-dflash: the prompt's last <= 2048 feature rows into the drafter's context
   S.prefill_ms = ms_since(t0);
   S.head_prefill_ms = L.head_ms;
   // round 0's seed: (H_{T-1}, t1)
@@ -622,12 +826,14 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
     int nc = L.copy_min > 0 ? copy_find(L, t1, L.copy_maxd, copy_buf) : 0;
     const bool copy = nc > 0;
     if (copy) D = nc;
+    // lab-dflash: the DFlash2 block drafter drafts this round when its context reaches T (else the MTP head)
+    const bool dround = !copy && dfl_on(L) && dfl_usable(L, T);
     // headroom: a round keeps up to D + 1 rows and the end-of-run flush needs 2 more (its dummy rows at T, T + 1),
     // so T + D + 1 + 2 <= tmax -- a run near the context end stops <= 2 tokens early instead of leaving a dirty state
     D = std::min(D, m.tmax - T - 3);
     if (D < 1) break;
     drain_ms = 0;
-    if (!copy && seed_n == 0) {  // after copy rounds: the head's KV over every pending pair but the last (the seed)
+    if (!copy && !dround && seed_n == 0) {  // after copy (or DFlash) rounds: the head's KV over every pending pair but the last (the seed)
       auto t0d = clk::now();
       L.Lh = Lh;
       head_drain(L, true, 1);
@@ -643,9 +849,9 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
     // lab-draft: the gated verify (NE_MTP_QGATE): draft Dd = D deep, then verify only the first D' <= Dd drafts whose
     // expected gain pays for their verify rows (by the drafts' own proposal probabilities, docs/mtp.md 11). Only with
     // sampled drafts (q known); A is then committed after the drafts are read instead of right behind the draft.
-    const bool gate = L.qgate && sdraft && !copy && depth > 0;  // (adaptive depth: the DepthPolicy decides)
-    const int Dd = copy ? 0 : D;  // drafted depth (the head's chain rows)
-    Recorder *drp = copy ? nullptr : &get_draft(L, seed_n, Dd, sdraft);
+    const bool gate = L.qgate && sdraft && !copy && !dround && depth > 0;  // (adaptive depth: the DepthPolicy decides)
+    const int Dd = copy || dround ? 0 : D;  // drafted depth (the head's chain rows)
+    Recorder *drp = copy || dround ? nullptr : &get_draft(L, seed_n, Dd, sdraft);
     ((DraftSP *)L.dsp.host())->round = (uint32_t)S.rounds;
     u32(L.h1.st.pos)[0] = (uint32_t)Lh;
     u32(L.vtok)[0] = (uint32_t)t1;
@@ -660,11 +866,65 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
       u32(L.xind)[1] = (uint32_t)(Dv + 1);
       u32(L.xind)[2] = 1u;
     };
-    if (copy)
+    // lab-dflash: rounds without a block draft add the last verify's rows to the drafter's context first (queued)
+    if (dfl_on(L) && !dround) dfl_flush_v(L, false);
+    double dgpu_d = 0;
+    mtp::Dist dq[8];
+    float dqd[8] = {};      // lab-dflash: q(d_j) of the block's drafts (greedy: the selector's softmax at the argmax)
+    Recorder *ap = nullptr;  // lab-dflash: A committed behind the block draft at kmax + 1 rows (B then runs at R <= that)
+    if (copy) {
       for (int j = 0; j < D; j++) u32(L.vtok)[j + 1] = (uint32_t)copy_buf[j];
-    else
+    } else if (dround) {  // the last verify's rows -> context, then the block: B - 1 drafts -> vtok[1 ..], proposals
+      MtpLoop::Dfl &d = *L.dfl;
+      uint32_t *P = u32(d.s.P);
+      const int cT = d.c.T + d.vcnt, cn = std::min(dfl::W, d.c.n + d.vcnt);
+      P[0] = (uint32_t)T;
+      P[1] = (uint32_t)d.vcnt;
+      P[2] = (uint32_t)d.c.T;
+      P[3] = (uint32_t)(T - std::min(cn, dfl::W - 1));
+      const dfl::SelP sel{(uint32_t)t1, (uint32_t)(d.B - 1), greedy ? 0u : 1u, (uint32_t)(seed * 2654435761u + 977u),
+                          (uint32_t)S.rounds, 0, 0, 0, greedy ? 1.0f : m.P.temp, 0, 0, 0};
+      memcpy(d.s.SP.host(), &sel, sizeof sel);
+      u32(d.s.tok)[0] = (uint32_t)t1;
+      d.draft->commit();
+      // A (embedding + layer 0: per row / causal, lazy commit) at kmax + 1 rows right behind the draft, so the GPU does
+      // not wait for the host's gate; B then reads its first R rows (layer 0's pending rows: keep[0] <= R of them)
+      if (d.early_a && D >= 1) {
+        ap = get_verify(L, std::min(d.kmax, m.tmax - T - 3) + 1, !greedy, K).a.get();
+        ap->commit();
+      }
+      d.draft->wait();
+      dgpu_d = d.draft->gpu_ms();
+      d.c.T = cT;
+      d.c.n = cn;
+      d.vcnt = 0;
+      // the proposals q (16 (id, prob) per position) and q(d_j) for the gate
+      const int Pn = d.B - 1;
+      float qd[8];
+      const float *qo = (const float *)d.s.qo.host();
+      for (int j = 0; j < Pn; j++) {
+        const int dj = (int)u32(d.s.dr)[j];
+        qd[j] = 0;
+        for (int c2 = 0; c2 < dfl::NC; c2++) {
+          uint32_t id;
+          memcpy(&id, &qo[(j * dfl::NC + c2) * 2], 4);
+          const float pr = qo[(j * dfl::NC + c2) * 2 + 1];
+          if (pr > 0) {
+            dq[j].ids.push_back((int)id);
+            dq[j].p.push_back(pr);
+          }
+          if ((int)id == dj) qd[j] = pr;
+        }
+      }
+      const int kd = !d.gate ? (greedy ? std::min(d.kmax, d.kgreedy) : d.kmax) : dfl_gate_depth(d, qd, d.kmax, greedy);
+      for (int j = 0; j < Pn; j++) dqd[j] = qd[j];
+      D = std::max(1, std::min(kd, m.tmax - T - 3));
+      arm(D);
+      if (!ap) vp->a->commit();
+    } else {
       drp->commit();
-    if (!gate) {
+    }
+    if (!gate && !dround) {
       arm(D);
       vp->a->commit();
     }
@@ -674,7 +934,7 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
     mtp::Dist q[8];
     int drafts[8];
     for (int j = 0; j < Dd; j++) drafts[j] = (int)u32(L.vtok)[j + 1];
-    if (sdraft && !copy)
+    if (sdraft && !copy && !dround)
       for (int j = 0; j < Dd; j++) {
         const float *qr = (const float *)L.qb.host() + (size_t)(j + 1) * 64;
         for (int c = 0; c < 32; c++) {
@@ -702,12 +962,14 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
     Recorder &vb = greedy ? *v.bg : *v.bs;
     vb.commit();
     const double t_bc = ms_since(tr);
-    v.a->wait();
+    Recorder &va = ap ? *ap : *v.a;
+    va.wait();
     vb.wait();
     th = clk::now();
-    const double dgpu = drp ? drp->gpu_ms() : 0.0;
+    const double dgpu = drp ? drp->gpu_ms() : dgpu_d;
+    if (dfl_on(L) && L.dfl->cfeat->in_flight()) L.dfl->cfeat->wait();
     S.draft_gpu_ms += dgpu;
-    S.verify_gpu_ms += v.a->gpu_ms() + vb.gpu_ms();
+    S.verify_gpu_ms += va.gpu_ms() + vb.gpu_ms();
     mtp::VerifyResult res;
     float qtr[16];
     const float *trace_q = nullptr;
@@ -719,8 +981,8 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
       mtp::Dist p[8];
       for (int j = 0; j < R; j++) p[j] = mtp::shortlist_dist((const float *)L.sl.host() + (size_t)j * K * 2, K, sp);
       // copy drafts (and argmax drafts) are point masses: q = nullptr
-      res = mtp::accept_sampled_p(drafts, D, p, sdraft && !copy ? q : nullptr, rng);
-      if (L.trace && sdraft && !copy) {
+      res = mtp::accept_sampled_p(drafts, D, p, dround ? dq : sdraft && !copy ? q : nullptr, rng);
+      if (L.trace && sdraft && !copy && !dround) {
         for (int j = 0; j < D; j++) {
           qtr[2 * j] = q[j].prob(drafts[j]);
           qtr[2 * j + 1] = q[j].p.empty() ? 0.0f : q[j].p[0];
@@ -766,7 +1028,8 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
     m.T = T;
     u32(L.keep)[0] = (uint32_t)c;
     const float *hvr = (const float *)L.hv[m.L.size() % 2].host();
-    if (copy) {
+    if (dfl_on(L)) L.dfl->vcnt = c;  // lab-dflash: this verify's committed rows (feat rows 0 .. c - 1) go to the context next
+    if (copy || dround) {  // (DFlash rounds: the head did not run either)
       // copy round: the head did not run. Its pending pairs = the old seed rows (if any) + every committed verify row
       // (target hidden, the token after it); a head round drains them (KV only) before its seed step.
       if (seed_n > 0) {
@@ -794,9 +1057,24 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
     }
     t1 = res.next_token;
     const double wall = ms_since(tr);
-    if (copy) S.copy_rounds++, S.copy_tokens += c;
-    else if (!gate) pol.observe(D, a, wall);
-    if (sdraft && !copy) qgate_observe(L, drafts, q, D, a, R, wall + host_pre / 1e3, c);
+    if (copy) {
+      S.copy_rounds++, S.copy_tokens += c;
+    } else if (dround) {
+      S.dfl_rounds++, S.dfl_tokens += c;
+      MtpLoop::Dfl &d = *L.dfl;
+      for (int j = 0; j < D && j <= a; j++) {
+        double &x = (greedy ? d.qaccg : d.qacc)[qbin(dqd[j])];
+        x = 0.97 * x + 0.03 * (j < a ? 1.0 : 0.0);
+      }
+      // (round costs stay the measured priors: learning them from wall time made a run's rounds depend on timing,
+      // so runs did not repeat; NE_DFL_COST_EMA=1 learns them anyway)
+      static const bool cost_ema = getenv("NE_DFL_COST_EMA") && atoi(getenv("NE_DFL_COST_EMA")) > 0;
+      double *vc = greedy ? d.vcostg : d.vcost;
+      if (cost_ema && R < 9) vc[R] = 0.9 * vc[R] + 0.1 * (wall + host_pre / 1e3);
+    } else if (!gate) {
+      pol.observe(D, a, wall);
+    }
+    if (sdraft && !copy && !dround) qgate_observe(L, drafts, q, D, a, R, wall + host_pre / 1e3, c);
     if (L.rdump) {  // lab-verify: R, c, routes u16 [48][R][10]
       const uint32_t *rc = (const uint32_t *)L.rcap.host();
       std::vector<uint16_t> o = {(uint16_t)R, (uint16_t)c};
@@ -807,7 +1085,7 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
     }
     if (L.trace)  // round D a c copy seed draft_gpu A_gpu B_gpu wall draft_wait B_commit host_pre_us gather_us drain_ms
       fprintf(L.trace, "R %d %d %d %d %d %.3f %.3f %.3f %.3f %.3f %.3f %.1f %.1f %.3f %d\n", D, a, c, copy ? 1 : 0,
-              seed_n, dgpu, v.a->gpu_ms(), vb.gpu_ms(), wall, t_dw, t_bc, host_pre, gus, drain_ms, Dd);
+              seed_n, dgpu, va.gpu_ms(), vb.gpu_ms(), wall, t_dw, t_bc, host_pre, gus, drain_ms, Dd);
     if (L.trace && trace_q) {  // + per draft: its proposal probability q(d_j) and the proposal's top probability
       fprintf(L.trace, "Q");
       for (int j = 0; j < D; j++) fprintf(L.trace, " %.4f %.4f", trace_q[2 * j], trace_q[2 * j + 1]);
@@ -823,6 +1101,7 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
     fflush(L.trace);
   }
   u32(L.xind)[0] = 0;
+  if (dfl_on(L)) dfl_flush_v(L, true);  // lab-dflash: the last round's rows into the drafter's context (before the flush)
   // ---- leave a clean state = prompt + out[0, k - 1) that plain steps, snapshots and mtp_generate_from continue:
   // the last round's kept rows are still lazy (keep[0]); a 2-row verify over dummy tokens at pos T commits them
   // (GDN ssm / conv, PLE conv) and its own rows stay pending (keep[0] = 0 drops them; KV rows >= T are past pos)
@@ -861,7 +1140,10 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
   } else {
     m.dirty = false;
     L.head_gen = m.gen;
+    if (dfl_on(L)) L.dfl->gen = m.gen;
   }
+  L.last_dfl_rounds = S.dfl_rounds;
+  L.last_dfl_tokens = S.dfl_tokens;
   if (st) *st = S;
   return k;
 }
@@ -996,7 +1278,7 @@ int mtp_prof(MtpLoop &L, int T, int reps, double *out, int nout) {
     for (int D = 1; D <= 4; D++)
       v.push_back(D <= L.maxd && W.draft_bits ? med(get_draft(L, n, D, true)) : 0.0);
   for (int sd = 1; sd >= 0; sd--)
-    for (int R = 2; R <= 5; R++) {
+    for (int R = 2; R <= 7; R++) {
       if (R > L.maxd + 1) { v.push_back(0); continue; }
       MtpLoop::Verify &vv = get_verify(L, R, sd, 20);
       v.push_back(med(*vv.a, true, sd ? vv.bs.get() : vv.bg.get()));
@@ -1027,6 +1309,7 @@ struct ne_fn_mtp_snap {
   std::vector<int> pt;
   std::vector<int> ctx;  // lab-draft: the copy rule's token history (positions [ctx0, T))
   int ctx0 = 0;
+  std::vector<uint8_t> dfl;  // lab-dflash: the drafter's context (kDflStateBytes; empty = none)
   ~ne_fn_mtp_snap() { ne_fn_snap_free(ms); }
 };
 static void stats_out(const MtpStats &s, int maxd, double *stats, int *hist) {
@@ -1096,6 +1379,193 @@ static void rerecord_verifies(MtpLoop &L) {
       v.bs->run();
     }
     reset(*L.m);
+}
+// ---- lab-dflash, step A (docs/mtp.md 13): a host-driven loop for the DFlash2 feasibility measurement. The drafter
+// runs outside (tools/dflash_ref.py); the engine verifies R rows at the current T, returns the sampled top-K readout
+// (K = 20 (id bits, logit) pairs per row, as the loop's shortlist) and the target features, and commits c rows.
+NE_API int ne_fn_dfl_capture(ne_fn_mtp *p, int on) {
+  return c_call([&] {
+    NE_CHECK(p, "null argument");
+    if (p->p->dfl_cap == (on > 0)) return;
+    p->p->dfl_cap = on > 0;
+    rerecord_verifies(*p->p);
+  });
+}
+NE_API int ne_fn_dfl_reset(ne_fn_mtp *p) {
+  return c_call([&] {
+    NE_CHECK(p, "null argument");
+    MtpLoop &L = *p->p;
+    reset(*L.m);
+    ctx_reset(L, 0);
+    u32(L.keep)[0] = 0;
+    u32(L.xind)[0] = 0;
+  });
+}
+// topk f32 [R][20][2], feat f32 [R][12800] (either may be NULL), gpu_ms (A + B; may be NULL)
+NE_API int ne_fn_dfl_verify(ne_fn_mtp *p, const int *toks, int R, float *topk, float *feat, double *gpu_ms) {
+  return c_call([&] {
+    NE_CHECK(p && toks, "null argument");
+    MtpLoop &L = *p->p;
+    Model &m = *L.m;
+    NE_CHECK(L.dfl_cap, "ne_fn_dfl_capture(p, 1) first");
+    NE_CHECK(R >= 2 && R <= L.maxd + 1 && m.T + R + 2 <= m.tmax, "dfl_verify: R %d at T %d", R, m.T);
+    MtpLoop::Verify &v = get_verify(L, R, true, 20);
+    for (int j = 0; j < R; j++) {
+      NE_CHECK(toks[j] >= 0 && toks[j] < VOCAB, "token %d", toks[j]);
+      u32(L.vtok)[j] = (uint32_t)toks[j];
+    }
+    u32(m.pos)[0] = (uint32_t)m.T;
+    u32(L.xind)[0] = 0;
+    u32(L.xind)[1] = (uint32_t)R;
+    u32(L.xind)[2] = 1u;
+    v.a->commit();
+    gather_ple_rows(m, m.hist[0], m.hist[1], toks, R, (float *)v.s.ple_emb.host());
+    v.bs->commit();
+    v.a->wait();
+    v.bs->wait();
+    if (topk) memcpy(topk, L.sl.host(), (size_t)R * 20 * 2 * 4);
+    if (feat) memcpy(feat, L.feat.host(), (size_t)R * 5 * HID * 4);
+    if (gpu_ms) *gpu_ms = v.a->gpu_ms() + v.bs->gpu_ms();
+  });
+}
+// the first c rows of the last verify (toks = its tokens) enter every cache (lazily, as a round's commit)
+NE_API int ne_fn_dfl_commit(ne_fn_mtp *p, const int *toks, int c) {
+  return c_call([&] {
+    NE_CHECK(p && toks && c >= 1 && c <= 8, "bad arguments");
+    MtpLoop &L = *p->p;
+    Model &m = *L.m;
+    for (int j = 0; j < c; j++) {
+      m.hist[0] = m.hist[1];
+      m.hist[1] = toks[j];
+    }
+    m.T += c;
+    m.gen++;
+    m.dirty = true;
+    u32(L.keep)[0] = (uint32_t)c;
+  });
+}
+// lab-dflash: the DFlash2 drafter on (dir = the checkpoint) with B block rows, at most kmax drafts verified (the q-gate
+// picks 1 .. kmax per sampled round), drafter weights at `bits` (8 / 4). Re-records the verifies (feature capture) and
+// the model's step recordings; resets the model.
+static void dfl_enable(MtpLoop &L, const std::string &dir, int B, int kmax, int bits, int gate) {
+  Model &m = *L.m;
+  auto d = std::make_unique<MtpLoop::Dfl>();
+  d->w = dfl::load(dir, bits);
+  NE_CHECK(B >= 2 && B <= dfl::RMAX, "dflash block %d (2..8)", B);
+  d->B = B;
+  d->kmax = std::max(1, std::min({kmax, B - 1, L.maxd}));
+  d->kgreedy = std::min(d->kmax, 3);
+  if (const char *e = getenv("NE_DFL_KGREEDY")) d->kgreedy = std::clamp(atoi(e), 1, d->kmax);
+  if (const char *e = getenv("NE_DFL_MIN_CTX")) d->minctx = std::max(0, atoi(e));
+  if (const char *e = getenv("NE_DFL_EARLY_A")) d->early_a = atoi(e) > 0;
+  d->gate = gate != 0;
+  d->c = dfl::alloc_ctx();
+  d->s = dfl::alloc_scratch(B);
+  for (int i = 0; i < dfl::RMAX; i++) u32(d->s.tok)[i] = (uint32_t)d->w.mask;
+  d->fs = alloc(DType::F32, {dfl::W, dfl::FEAT});
+  d->stage = alloc(DType::F32, {16, dfl::FEAT});
+  // acceptance by q(d) bin, priors measured on the h2h prompts (docs/mtp.md 13); round ms by verify rows
+  const double pri[10] = {0.22, 0.37, 0.40, 0.48, 0.52, 0.48, 0.58, 0.57, 0.71, 0.93};
+  for (int b = 0; b < 10; b++) d->qacc[b] = d->qaccg[b] = d->qacc0[b] = pri[b];
+  // round ms by verify rows (draft + A + B + host; in-loop 19 Oct, docs/mtp.md 13)
+  const double vc[9] = {14.0, 14.5, 20.2, 23.9, 27.3, 31.6, 34.4, 37.5, 40.5};
+  for (int R = 0; R < 9; R++) d->vcost[R] = d->vcostg[R] = d->vcost0[R] = vc[R];
+  d->draft = std::make_unique<Recorder>();
+  d->draft->begin();
+  dfl::record_ctx_rows(*d->draft, d->w, d->c, d->s, L.feat, 8, 0);
+  dfl::record_block(*d->draft, d->w, d->c, d->s, L.W, m.embed, L.vtok);
+  d->draft->end();
+  d->cfeat = std::make_unique<Recorder>();
+  d->cfeat->begin();
+  dfl::record_ctx_rows(*d->cfeat, d->w, d->c, d->s, L.feat, 8, 0);
+  d->cfeat->end();
+  L.dfl = std::move(d);
+  L.dfl_cap = true;
+  set_dfl_capture(m, true);
+  prefill_set_dfl(chunked(m), &L.dfl->fs);
+  rerecord_verifies(L);  // (resets the model)
+  {  // first replays now (pipelines, residency), an empty context
+    MtpLoop::Dfl &x = *L.dfl;
+    memset(x.s.P.host(), 0, 32);
+    const dfl::SelP sel{0, (uint32_t)(B - 1), 1, 1, 0, 0, 0, 0, 1.0f, 0, 0, 0};
+    memcpy(x.s.SP.host(), &sel, sizeof sel);
+    x.draft->run();
+    x.cfeat->run();
+    dfl_drain_rec(L, 1).run();
+  }
+  u32(L.vtok)[0] = 0;
+  reset(m);
+  ctx_reset(L, 0);
+  dfl_reset(L, 0);
+}
+NE_API int ne_fn_dfl_enable(ne_fn_mtp *p, const char *dir, int block, int kmax, int bits, int gate) {
+  return c_call([&] {
+    NE_CHECK(p && dir, "null argument");
+    dfl_enable(*p->p, dir, block, kmax, bits, gate);
+  });
+}
+// lab-dflash: the gate on / off (sampled rounds verify kmax drafts when off); kmax (1 .. B - 1, <= max_depth)
+NE_API int ne_fn_dfl_set(ne_fn_mtp *p, int gate, int kmax, int active) {
+  return c_call([&] {
+    NE_CHECK(p && p->p->dfl, "DFlash2 drafter not enabled");
+    MtpLoop::Dfl &d = *p->p->dfl;
+    if (active >= 0 && d.active != (active != 0)) {
+      d.active = active != 0;
+      d.gen = ~0ull;  // its context restarts with the next feed / run
+    }
+    if (gate >= 0) d.gate = gate != 0;
+    if (kmax > 0) d.kmax = std::max(1, std::min({kmax, d.B - 1, p->p->maxd}));
+    d.kgreedy = std::min(d.kgreedy, d.kmax);
+  });
+}
+NE_API int ne_fn_dfl_on(ne_fn_mtp *p) { return p && p->p->dfl ? 1 : 0; }
+// lab-dflash checks (tests/mtp/test_dflash.py): the drafter's context set directly from host feature rows, and one
+// block draft from it with its internals read back.
+NE_API int ne_fn_dfl_ctx_reset(ne_fn_mtp *p, int T) {
+  return c_call([&] {
+    NE_CHECK(p && p->p->dfl, "DFlash2 drafter not enabled");
+    dfl_reset(*p->p, T);
+  });
+}
+NE_API int ne_fn_dfl_ctx_push(ne_fn_mtp *p, int pos, const float *feat, int n) {
+  return c_call([&] {
+    NE_CHECK(p && p->p->dfl && feat && n >= 1, "bad arguments");
+    dfl_push(*p->p, pos, feat, n);
+    dfl_drain(*p->p);
+  });
+}
+// hn f32 [B - 1][2560] (final-normed rows 1 ..), sl f32 [B - 1][16][2] (candidates: id bits, exact logit), drafts
+// [B - 1], qo f32 [B - 1][16][2] (proposals); any may be NULL. The block sits at the context's end (T = c.T).
+NE_API int ne_fn_dfl_probe(ne_fn_mtp *p, int anchor, int sampled, float temp, uint32_t seed, float *hn, float *sl,
+                           int *drafts, float *qo, double *ms) {
+  return c_call([&] {
+    NE_CHECK(p && p->p->dfl, "DFlash2 drafter not enabled");
+    MtpLoop &L = *p->p;
+    MtpLoop::Dfl &d = *L.dfl;
+    NE_CHECK(d.fsn == 0 && d.vcnt == 0, "dflash probe: context rows pending");
+    uint32_t *P = u32(d.s.P);
+    P[0] = (uint32_t)d.c.T;
+    P[1] = 0;
+    P[2] = (uint32_t)d.c.T;
+    P[3] = (uint32_t)(d.c.T - std::min(d.c.n, dfl::W - 1));
+    const dfl::SelP sel{(uint32_t)anchor, (uint32_t)(d.B - 1), sampled ? 1u : 0u, seed, 0, 0, 0, 0, temp, 0, 0, 0};
+    memcpy(d.s.SP.host(), &sel, sizeof sel);
+    u32(d.s.tok)[0] = (uint32_t)anchor;
+    d.draft->run();
+    const int Pn = d.B - 1;
+    if (hn) memcpy(hn, d.s.hn.host(), (size_t)Pn * dfl::H * 4);
+    if (sl) memcpy(sl, d.s.sl.host(), (size_t)Pn * dfl::NC * 2 * 4);
+    if (qo) memcpy(qo, d.s.qo.host(), (size_t)Pn * dfl::NC * 2 * 4);
+    if (drafts) for (int j = 0; j < Pn; j++) drafts[j] = (int)u32(d.s.dr)[j];
+    if (ms) *ms = d.draft->gpu_ms();
+  });
+}
+// the last run's DFlash2 rounds and the tokens they emitted (MtpStats::dfl_*)
+NE_API int ne_fn_dfl_last(ne_fn_mtp *p, int *rounds, int *tokens) {
+  if (!p) return -1;
+  if (rounds) *rounds = p->p->last_dfl_rounds;
+  if (tokens) *tokens = p->p->last_dfl_tokens;
+  return 0;
 }
 NE_API int ne_fn_mtp_set_moe_dedupe(ne_fn_mtp *p, int on) {
   return c_call([&] {
@@ -1294,6 +1764,10 @@ NE_API ne_fn_mtp_snap *ne_fn_mtp_snapshot(ne_fn_mtp *p) {
     } else {
       s->ctx0 = ne_fn_snap_T(ms);
     }
+    if (L.dfl) {
+      s->dfl.resize(kDflStateBytes);
+      dfl_export(L, s->dfl.data());
+    }
     out = s.release();
   });
   return out;
@@ -1314,12 +1788,14 @@ NE_API int ne_fn_mtp_restore(ne_fn_mtp *p, const ne_fn_mtp_snap *s) {
     }
     ctx_reset(L, s->ctx0);
     L.ctx = s->ctx;
+    if (L.dfl) dfl_import(L, s->dfl.empty() ? nullptr : s->dfl.data());
   });
 }
 
 NE_API int ne_fn_mtp_snap_T(const ne_fn_mtp_snap *s) { return s ? ne_fn_snap_T(s->ms) : -1; }
 NE_API int64_t ne_fn_mtp_snap_bytes(const ne_fn_mtp_snap *s) {
-  return s ? ne_fn_snap_bytes(s->ms) + (int64_t)(s->ph.size() * 4 + s->pt.size() * 4 + s->ctx.size() * 4) : -1;
+  return s ? ne_fn_snap_bytes(s->ms) + (int64_t)(s->ph.size() * 4 + s->pt.size() * 4 + s->ctx.size() * 4 + s->dfl.size())
+           : -1;
 }
 NE_API void ne_fn_mtp_snap_free(ne_fn_mtp_snap *s) { delete s; }
 
@@ -1344,7 +1820,7 @@ NE_API int ne_fn_mtp_kv_io(ne_fn_mtp *p, int to_model, int a, int b, void *buf, 
 
 NE_API int64_t ne_fn_mtp_state_bytes(ne_fn_mtp *p) {
   if (!p || !p->model) return -1;
-  return ne_fn_state_bytes(p->model) + (int64_t)kMtpPendCap * (HCD + 1) * 4;
+  return ne_fn_state_bytes(p->model) + (int64_t)kMtpPendCap * (HCD + 1) * 4 + (p->p->dfl ? kDflStateBytes : 0);
 }
 
 NE_API int ne_fn_mtp_state_io(ne_fn_mtp *p, int to_model, void *buf, int64_t nbytes, int64_t *meta) {
@@ -1372,6 +1848,7 @@ NE_API int ne_fn_mtp_state_io(ne_fn_mtp *p, int to_model, void *buf, int64_t nby
         head_invalidate(L);
       }
       ctx_reset(L, L.m->T);  // the tokens are unknown here (ne_fn_mtp_set_context gives them)
+      if (L.dfl) dfl_import(L, (const char *)(pt + kMtpPendCap));  // lab-dflash: the drafter's context
     } else {
       const bool head = mtp_head_ok(L);
       if (head && !L.m->dirty) head_drain(L, false, 0);  // lazy head (lab-headlazy): catch up, <= 8 rows stay pending
@@ -1386,6 +1863,7 @@ NE_API int ne_fn_mtp_state_io(ne_fn_mtp *p, int to_model, void *buf, int64_t nby
         memcpy(ph, L.ph.data(), L.ph.size() * 4);
         memcpy(pt, L.pt.data(), L.pt.size() * 4);
       }
+      if (L.dfl) dfl_export(L, (char *)(pt + kMtpPendCap));  // lab-dflash
     }
   });
 }

@@ -7,7 +7,8 @@ and no MLX in the serving path. It runs one model family, **Qwen3.8-Flash-Next**
 Flash-Next**, and serves them over an OpenAI- and Anthropic-compatible HTTP API.
 
 - **EXL3 trellis weights**: 5-bit experts and a 6/8-bit trunk, decoded on the fly inside fused MoE and GEMV kernels.
-- **MTP speculative decoding** with the model's own multi-token-prediction head (draft depth 2 by default).
+- **MTP speculative decoding** with the model's own multi-token-prediction head (draft depth 2 by default), and an
+  opt-in **DFlash2 block drafter** in the same loop for about 7-10% more decode speed.
 - **Chunked prefill** on the M5 GPU's tensor units (NAX), with QSA sparse attention for long contexts (262K window).
 - **Prefix cache** in RAM and optionally on SSD. Conversations survive server restarts, and **shared-prefix
   snapshots** let a new session reuse the long system prompt and tool block that earlier sessions already prefilled.
@@ -22,7 +23,8 @@ Flash-Next**, and serves them over an OpenAI- and Anthropic-compatible HTTP API.
 - **About 90 GB of free unified memory** for one model at the full 262K context (~81 GB of weights plus ~28 KB per
   context token). In practice that means a 128 GB machine with no other model loaded.
 - About 185 GB of disk for one model: the 83 GB pack plus the 102 GB n-gram embedding table, which both models
-  share. A second model adds about 4 GB once the shared files are linked (see below), 83 GB otherwise.
+  share. A second model adds about 4 GB once the shared files are linked (see below), 83 GB otherwise. The optional
+  DFlash2 drafter adds about 1.2 GB on disk and about 1 GB of memory when enabled.
 - Xcode command-line tools with the Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`), and Python 3.11
   or newer for the server.
 
@@ -85,6 +87,12 @@ Server flags go after `--`, for example `tools/serve.sh start -- --ctx 65536 --c
 
 - `--ctx N`: the context window, which is also the reply cap (default 262144).
 - `--mtp N` (default 2; 0 turns MTP off) and `--mtp-policy auto|always|never`.
+- `--drafter mtp|dflash2` (default `mtp`): draft with Inco's DFlash2 block drafter inside the MTP loop. Needs
+  `--drafter-path DIR` (the draft model, see the section below), takes `--dflash-kmax N` (default 5, at most 5 in this
+  build) and `--dflash-bits 8|4` (default 8). `--mtp N` is the loop depth, so it must be at least kmax.
+- `--allow-any-model`: on a single-model server, let a request name any model and get the default one. Off by default:
+  an unknown name is a 400 that lists the ids served, in both directions, so a drafter run cannot silently be a
+  control run (docs/server.md 13).
 - `--effort xhigh|medium|low`: the reasoning effort for requests that do not set one.
 - `--cache-ram 8GB`, `--cache-disk 0` (for example `20GB` turns the SSD tier on), `--cache-dir`.
 - `--slots N`: concurrent requests per model. Each extra slot holds a full KV cache (~7 GB at 262K).
@@ -118,14 +126,41 @@ and best settings.
   turn starts in about 0.3 s when an earlier session already sent the same tool block and system prompt
   (shared-prefix snapshots).
 
-### In the lab, not in this release
+### DFlash2 drafter (opt-in, +7-10% decode)
 
-One measurement in the charts is a lab build, drawn as a hollow marker: **Ijah with Inco's DFlash2 block drafter**
-(120.4 tok/s, paired +6.7% and +10.1% over MTP depth 2 on a 19 Oct build). It is a drafter *inside* the MTP loop, not
-a replacement for it. `lab/dflash` is not merged into the released tree: this repository has no `--drafter` flag, and
-`nm -gU build/libengine.dylib | grep -c dfl` returns 0. Treat the 120.4 marker as a preview, and read it against that
-build's own MTP-only baseline (112.4 tok/s), not against the 98.9 bar. Its whisker is derived, not measured: the two
-paired ratios (1.067, CI 1.036-1.097; 1.101, CI 1.069-1.132) applied to that baseline, which gives 116.9-123.8.
+Inco's **DFlash2** is a 0.6B block-diffusion draft model: one pass proposes a whole block of tokens, keeps the top 16
+candidates per position, and a small selector traces one coherent path through them. In Ijah it is a **second drafter
+inside the MTP loop, not a replacement for it** - the native MTP head drafts the rounds the drafter's context cannot
+reach (a prompt shorter than 512 rows, copy-rule rounds) and stays in step so it can take over.
+
+Start it with the model id that asks for it:
+
+```sh
+hf download incoai/Qwen3.8-Flash-Next-DFlash2 --local-dir ~/.cache/ijah/drafters/Qwen3.8-Flash-Next-DFlash2
+tools/serve.sh start -- --mtp 5 --drafter dflash2 \
+  --drafter-path ~/.cache/ijah/drafters/Qwen3.8-Flash-Next-DFlash2
+# requests then send "model": "Swift-1.5-Flash-Next-native-dflash"
+```
+
+Measured on the same client as the charts (6 prompts x 3 seeds, 1,024 tokens, T=1, medium thinking), paired by prompt
+and seed: **120.4 tok/s against 112.4 and 108.9** for MTP depth 2, ratios **1.067 [1.036, 1.097]** (13 of 18 pairs) and
+**1.101 [1.069, 1.132]** (17 of 18). By prompt: maths +14%, reasoning prose +13%, parser code +11%, LRU code +2%,
+climate prose +1%, and low-acceptance prose **-3%** - the one prompt that loses.
+
+Two things about that number, both of which the chart keeps honest:
+
+- **The gate carries the win, not the drafter.** Per verified draft, DFlash2 is *not* better than the native head
+  (2.91-2.95 tokens per round against the head's 2.98 at depth 3). What is cheap is depth: a whole block draft costs
+  2.0-2.4 ms, while every extra verify row costs 3.0-3.6 ms, so a host-side gate verifies only the prefix that
+  maximises tokens per millisecond. Draft a fixed depth 3 with no gate and the drafter is **12% slower** than the head
+  alone.
+- **Compare it with its own baseline.** It was measured on a 19 Oct build whose MTP-only baseline was 112.4 tok/s; the
+  98.9 decode bar above is from 18 Oct, before the prefill and copy-rule merges landed. 120.4 against 98.9 would be a
+  fabricated 22%.
+
+This build instantiates the verify kernels to 6 rows, so `--dflash-kmax` tops out at 5 (verify runs kmax + 1 rows);
+deeper verify is built and measured in development, not here. Off by default: a server started without `--drafter` has
+no drafter, advertises no drafter id, and refuses a request that asks for one.
 
 ### How we measured
 
@@ -147,8 +182,11 @@ paired ratios (1.067, CI 1.036-1.097; 1.101, CI 1.069-1.132) applied to that bas
   windows); C, 32K-token code context (4 windows). Error bars are 95% bootstrap intervals over windows.
 - **Date:** 18 October 2026 for the speed and memory runs. Sushi's KLD is from 14 October, scored with the same bf16
   teacher, the same three sets and the same windows (16 / 16 / 4), so it is comparable set by set. The DFlash2 drafter
-  marker is a 19 October lab build. Sushi was removed from this machine on 19 October, so the Sushi arm is a frozen
-  measurement, not a reproducible one.
+  number is from 19 October, measured through the server on the build that carries the drafter; that build's MTP-only
+  baseline was 112.4 tok/s, which is why it is not comparable with the 98.9 decode bar (18 October, before the prefill
+  and copy-rule merges). Its whisker is derived, not measured: the two paired ratios (1.067, CI 1.036-1.097; 1.101,
+  CI 1.069-1.132) applied to that baseline, giving 116.9-123.8. Sushi was removed from this machine on 19 October, so
+  the Sushi arm is a frozen measurement, not a reproducible one.
 
 The charts are pre-rendered. `tools/make_charts.py` redraws them from the per-window results in `data/charts/`.
 
@@ -226,7 +264,7 @@ source comments name each upstream file.
 - [TensorFold](https://github.com/ashhart/TensorFold): the MTP copy-draft rule.
 - [Splish](https://github.com/publicExcess/splish): the pruned draft vocabulary.
 - [Inco](https://inco.ai/blog/dflash2/) and [z-lab](https://github.com/z-lab/dflash) (Apache-2.0): the DFlash2 block
-  drafter measured in the lab chart (its draft model is `incoai/Qwen3.8-Flash-Next-DFlash2`). Not in this release.
+  drafter, opt-in with `--drafter dflash2` (the draft model is `incoai/Qwen3.8-Flash-Next-DFlash2`).
 - The Qwen team, for Qwen3.8-Flash-Next (Qwen community licence).
 - UkisAI, for the Swift-1.5 fine-tune (Swift Open License 1.0, non-commercial).
 

@@ -941,3 +941,161 @@ It loses at R 3 (the d2 verify), and the R 4-5 gains are no bigger than this ses
 measured 24.1-26.2 ms at d3 today). Default off. Gate/up only: the down still reads every (row, slot) pair, and two
 concurrent dispatches over one barrier did not hide the multi kernel's R-row prep. The router builds the lists only
 when the split runs (a constant argument), so the default path does no extra work; `make test` ALL PASS after it.
+
+## 13. DFlash2 block drafter (lab-dflash, 19 Oct; opt-in `--drafter dflash2`)
+
+Inco's **Qwen3.8-Flash-Next-DFlash2** (huggingface incoai/Qwen3.8-Flash-Next-DFlash2 @ a22a1744e85c, Apache-2.0; 0.6B
+bf16, data only, downloaded to `~/.cache/ijah/drafters/Qwen3.8-Flash-Next-DFlash2`) as an alternative drafter in the MTP loop.
+**Result: same-client server (`--seed-mtp`, 6 prompts x 3 seeds x 1,024 tokens) 1.055-1.101x master's MTP d2 in three
+pairs (CIs above 1, 13-17 / 18 wins; final code: 120.4 vs 112.4 / 108.9 tok/s); in-process +7.7-8.3% mean.** Only
+text_crisis (low acceptance) loses (0.95-0.98). Default off.
+
+### 13.1 What the drafter is (config + the SGLang capture patch + z-lab `dflash/model.py`, read not run)
+- **Features**: for every target position, the *completed* outputs of layers **5, 15, 25, 35, 45** (0-based), i.e. the
+  4-stream hyper-connection residual (pre-mixer) after the layer, **averaged over the 4 streams** (the patch's
+  `hidden.unflatten(-1, (4, 2560)).mean(-2)`), concatenated -> 12,800. Checked on the engine: shifting every layer by
+  +-1 drops 3 drafts' tokens / round from 2.95 to 2.86-2.87.
+- **Context** row j = `hidden_norm(fc(f_j))`; per drafter layer its K / V = rope(k_norm(k_proj c_j)) / v_proj c_j (no
+  input norm, no conv), at the target position j. Sliding window 2048 (non-causal: |q - k| < 2048).
+- **Block**: rows `[anchor, mask (248077) x (B - 1)]` (anchor = the last emitted token, in no cache yet) at positions
+  T .. T + B - 1, input = the target's embedding. 5 Qwen3 layers (32 / 8 heads x 128, rope theta 1e4), each with two
+  **two-tap dynamic grouped convolutions**: `conv_s(x)[r] = sum_t x[r - t] (base[s][t] + dyn[r][s][t][c / 16])`,
+  dyn = kernel_projection(norm(h)) [2 stages][2 taps][160 groups]: stage 0 before q / k / v (and gate / up), stage 1
+  after o_proj (and down), then the residual. Attention over context + all block rows. Final norm, the **target's
+  lm_head** on rows 1 .. B - 1, top 16 per row (unary = raw logits).
+- **Selector**: from the anchor, position p scores its 16 candidates `unary_i + <pred_cb[prev] * W_sel hn_p,
+  succ_cb[cand_i]>` (rank 256); greedy argmax, sampled `q = softmax(score / T)` over the 16 (no top-k / top-p): the
+  draft is drawn from q and **q is the proposal** for exact acceptance (section 5.2). Trained block 8; the card serves 4.
+
+### 13.2 Step A: acceptance before building (host-driven rounds; `tools/dflash_ref.py`, MLX reference drafter)
+`ne_fn_dfl_verify` / `_commit` run real verifies (features captured) while the MLX drafter drafts; exact sampled
+accept at T 1 / top-p 0.95 / top-k 20, 6 h2h prompts x 512 tokens, MTP from the loop on the same seeds:
+
+| drafts verified / round | DFlash2 B 4 | DFlash2 B 8 | native MTP |
+|---|---|---|---|
+| 2 | | 2.47 tok / round | **2.50** (d2) |
+| 3 | 2.95 | 2.91 | **2.98** (d3) |
+| 4 / 5 | | 3.23 / 3.43 | |
+
+So per verified draft DFlash2 is **not** better than our MTP here (the card's +0.2-0.4 tokens is against SGLang's MTP;
+ours drafts from the head's shortlist with exact q, 10.3). Its edge is a free deep block: a **q-gated verify** (verify
+the prefix k <= 5 that maximises E[tokens](k) / cost(k + 1), E from P(accepted | q(d) bin)) simulated exactly from
+k = 5 rounds (2-fold held-out calibration): **+9-14% over MTP d2** at a 1.0-2.5 ms drafter, fixed k = 3 only +1-3%.
+
+### 13.3 Engine implementation (`models/flash_next/dflash.{h,mm,metal}`, `mtp_loop.mm`)
+- Weights: the checkpoint mapped (`Pack::open`), matrices quantised at load to 8-bit MLX affine g64 (CPU, 0.6 s;
+  `NE`/server `--dflash-bits 4`: q / o / MLP at 4 bits — no faster, record_qn is ALU-bound), the codebooks read in
+  place. GEMMs = `nax::record_q8` at <= 8 rows; small kernels: `dfl_rms`, `dfl_conv`, `dfl_qk_prep`, `dfl_attn` (8 KV
+  heads x 16 key splits, online softmax, fixed-order `dfl_attn_reduce`), `dfl_select`. Readout = the loop's pruned
+  4-bit draft head + `mtp_topk_local` / `mtp_shortlist` at K 16 (exact 8-bit re-score; the proposal is what is drawn,
+  so exactness holds). **One block draft = 2.0-2.4 ms GPU** (B 8, incl. adding the last verify's rows to the context).
+- Features: every verify (`route_cap` hook, `L.feat`), the 1-row / 4-row steps (`record_b` hook, `Model::dfl_f`,
+  `set_dfl_capture`), chunked prefill (`get_rec` hook: each chunk's last <= 2048 rows into the ring `fs` by position;
+  `prefill_set_dfl`).
+- Context bookkeeping (`MtpLoop::Dfl`): rings (c bf16 [2048][2560], K / V bf16 per layer) hold positions [T - n, T);
+  then `vcnt` committed rows of the last verify, then `fsn` feature rows (prefill / steps) — drained in 16-row groups
+  (`dfl_drain`; 2048 rows ~15 ms) at a feed's end and a run's start. Validity like the head's (`gen`). A round uses
+  the block drafter when the context reaches T with >= min(T, 512) rows (`NE_DFL_MIN_CTX`), else the MTP head (kept
+  in step meanwhile like after copy rounds: its pairs queue as pending rows); the copy rule keeps priority.
+- Round: draft recording (context add + block) -> **A (embedding + layer 0) committed right behind it at kmax + 1
+  rows** (layer 0 is a causal GDN layer with lazy commit, so B at the gated R <= kmax + 1 reads its first R rows; this
+  hid the host's gate round trip: +4% vs committing A after the gate) -> host reads drafts + q, gate picks k -> B at
+  R = k + 1 -> accept (greedy, or `accept_sampled_p` with q). Greedy rounds gate on the selector's softmax confidence
+  (drafts stay argmax). The gate's acceptance table starts from the priors every run and learns per run; round costs
+  are fixed priors (learning them from wall time made runs not repeat).
+- Checkpoints: `ne_fn_mtp_state_io` / snapshots carry header + the c ring (+10.5 MB); import rebuilds K / V from it
+  (`record_rebuild`, ~10 ms); a stale / absent block restarts the context at T.
+- API: `ne_fn_dfl_enable(p, dir, block, kmax, bits, gate)`, `_set(gate, kmax, active)`, `_on`, `_last`, checks
+  `_ctx_reset` / `_ctx_push` / `_probe`, step A `_capture` / `_reset` / `_verify` / `_commit`. Server: `--drafter
+  dflash2 [--drafter-path DIR] [--dflash-kmax 5] [--dflash-bits 8]` (the loop is created with max depth >= kmax).
+  Env: `NE_DFL_EARLY_A=0`, `NE_DFL_KGREEDY`, `NE_DFL_MIN_CTX`, `NE_DFL_COST_EMA=1`.
+
+### 13.4 Speed
+In-process (`tools/bench_draft.py --dflash DIR --max-depth 5 --configs copy,copy@dfl=1`, configs alternated per
+prompt — config-major order biased earlier A/Bs by the GPU's drift), sampled, 6 prompts x 1,024:
+
+| run | MTP d2 (copy) mean / median | DFlash2 gated mean / median |
+|---|---|---|
+| A after the gate (first build) | 113.5 / 114.4 | 115.0 / 113.6 |
+| A behind the draft, 8-bit | 109.8 / 110.2 | 117.7 / 123.7 |
+| same, 2 seeds | 110.2 / 112.5 | **119.4 / 126.9** (9 / 12 wins) |
+| final (per-run gate state, fixed costs) | 112.3 / 114.5 | **121.0 / 122.5** |
+| fixed k = 3, no gate | | 100.4 (-12%: R 4 every round) |
+| greedy (gated, 512 tokens) | 111.4 | 118.3 |
+
+Per round (trace): drafting 2.2 ms + host gap 0.8-1.1 vs MTP 1.6 + 0.5; rounds by verified drafts d1..d5 cost 20.2 /
+24.0 / 27.6 / 31.9 / 34.6 ms for 1.5 / 2.1 / 3.0 / 3.9 / 4.9 tokens (MTP d2: 22.0 ms, 2.47).
+Same client (`session.sh ijah`, `--seed-mtp`, REPS 1, DREPS 3), paired by (prompt, seed):
+
+| pair | base tok/s | DFlash2 tok/s | ratio (95% CI), wins |
+|---|---|---|---|
+| ABBA 1 (11:44-11:56) | 109.5 / 111.8 | 117.5 / 118.5 | 1.070 [1.038, 1.103] 14 / 18; 1.055 [1.022, 1.088] 14 / 18 |
+| final code (12:20-12:35) | 112.4 / 108.9 | 120.4 | 1.067 [1.036, 1.097] 13 / 18; 1.101 [1.069, 1.132] 17 / 18 |
+
+Per prompt (ABBA 1): code_parser +11%, math_proof +14%, text_trains +13%, code_lru +2%, text_climate +1%,
+text_crisis -3%.
+
+### 13.5 Correctness
+- `tests/mtp/test_dflash.py` (engine vs the MLX reference on the same real-feature context, 3 prompts): final hidden
+  rel L2 1.3-2.2% (8-bit weights), 14-16 / 16 candidates shared, logit error <= 0.21, **greedy drafts identical (7 / 7)**,
+  q TV <= 0.009 (the reference's selector uses the bf16 projection): ALL PASS.
+- `test_sampled_dist.py --dflash` (text_crisis, depth 2, 400 runs, first round a DFlash round): out[1] TV 0.059 (noise
+  95% 0.062, P 0.06), out[2] | ' Explain' 0.063 (0.101), | ' Assume' 0.015 (0.031): OK.
+- Greedy vs the no-MTP step path (`bench_draft --greedy`): every first mismatch at a 1-row logit gap 0.000 / 0.125.
+- `test_mtp_cont.py --whole --dflash` (both prefill modes, d2 + adaptive): **all pass** (fresh repeats, snapshot /
+  restore exact, live continuation, cut runs, state / KV park, lazy head); 4-layer model too. (The park check now
+  hands the copy rule its token history back after the import, as the server does: without it a copy round of the
+  reference text cannot fire after the park.)
+- `mtp-accept-test`, server `run_mock.sh`: all pass; `make test` ALL PASS (141 checks).
+
+### 13.6 Traps
+- Gate state that persists across runs, or is learned from wall time, makes runs not repeat (different verify
+  widths fork at bf16 ties): reset per run, fixed costs.
+- The A-after-gate round trip cost ~0.5 ms per round (GPU idle while the host gates); A at kmax + 1 behind the
+  draft fixed it — valid only because layer 0 is causal with lazy commit.
+- A shared Prefill (lab-srvperf, base + Swift) writes the features of either model's prefill into the ring of the one
+  that enabled DFlash: only acceptance can suffer (pending step rows), never output.
+- R = 7 verify kernels were not instantiated (`fn_moe_router_r7`, ...), which is why kmax was capped at 5 (d5 rounds
+  are the cheapest per token, 7.1 ms). They turn out to compile and link with no other change (19 Oct, +124 kernels,
+  metallib 6.65 -> 6.98 MB): `kernels/fn_trunk.metal` + `kernels/fn_moe.metal` now instantiate R = 7, and the MTP GDN
+  step (`mtp.metal` MTP_INST / MTP_INST_L) and QSA (`QSA_INST_R`) already had it. `fn_hc_pre_*_r7` fits the staging
+  that forces r8 into 2 x 4 rows, so 7 rows stays one dispatch (`nax.mm` hc_pre check now allows R <= 7).
+  **The 7-row round has never been run**: the whole-model GPU slot was held by the :8140 server all day.
+  A missing pipeline at 7 rows fails loudly in `Pipelines::get`, not silently; the 6-row path proves the ple /
+  dense-attn families (`fn_ple_mix_r6`, `fn_attn_core_r6` are not instantiated either) are not on the verify path.
+- `--dflash DIR` is `tools/bench_draft.py`'s flag, **not** the server's: `ne_server.py` spells it `--drafter dflash2
+  --drafter-path DIR`. argparse prefix-matches, so handing `--dflash` to the server is `error: ambiguous option:
+  --dflash could match --dflash-kmax, --dflash-bits` and exits 2 in 0 s — before any model load, so the supervisor
+  counts it as a crash and restarts it (19 Oct 13:39: 2 restarts before it was caught by hand).
+
+### 13.7 What is left
+- **Serving it as a model id (`Swift-1.5-Flash-Next-native-dflash`).** `server/models.json` maps the id to Swift-1.5's
+  packs; the drafter itself is a start flag: `tools/serve.sh start -- --mtp 5 --drafter dflash2 --drafter-path DIR
+  --dflash-kmax 5 --dflash-bits 8` (`--mtp` must be >= kmax, and kmax clamps to min(kmax, block - 1, the loop depth)).
+  Verified CPU-only first: `--mock` with that exact flag set comes up (MTP depth 5, listening). The GPU start
+  (`ne_fn_dfl_enable` on the 86 GB model) and the +6% at the server were the untested part at the time of writing;
+  both have since been seen on a GPU: the drafter enabled in 1.3 s with `--mtp 5` not clamped, the served id answered
+  requests, and 120.4 vs 112.4 tok/s measured through the server (13.4).
+- **Serving flags and the id are one trap.** A launch script that passes a flag the server does not have exits 2 in 0 s,
+  which a supervisor reads as a crash and burns its restarts on; argparse prefix-matching makes it worse, because
+  `--dflash DIR` is accepted as ambiguous between `--dflash-kmax` and `--dflash-bits` long after the typo. A launcher
+  should check the server it is about to start accepts the flags (`grep -q 'add_argument("--drafter"` is enough) and
+  fail in the menu, not in the restart loop.
+- **kmax 6-7: enabled in code, needs one measurement.** Everything above is committed; `mtp_prof`
+  (`tools/bench_draft.py --prof`) now profiles a round at up to 7 rows, and the per-R verify table comes from
+  `tools/bench_mtp.py --time`, which already loops R over `--max_depth + 2` (no change needed to price R = 7). To settle it on a free GPU slot:
+  `tools/with_lock.sh "DFlash kmax 6-7 (~85 GB)" -- <tools/bench_draft.py --dflash DIR --max-depth 7
+  --configs copy,copy@dfl=1 (kmax 5 / 6 / 7)>`, then the same client:
+  `REPS=1 DREPS=3 tests/h2h/session.sh ijah --seed-mtp` with `--dflash-kmax 6` and `7`.
+  Expect it to pay only on predictable text (text_crisis is already -3% at kmax 5); the gate has to be willing to
+  verify 6-7 rows, and A runs at kmax + 1 = 8 rows (the 2 x 4 split path).
+- a cheaper draft (2.2 ms: ~110 dispatches; fused norm + conv); per-request choice
+  between the block drafter and the head on low-acceptance text (text_crisis); a better gate predictor.
+
+### 13.8 Attribution
+Drafter weights: Inco AI, DFlash 2 (inco.ai/blog/dflash2), Apache-2.0. Architecture / generation loop: z-lab/dflash
+(`dflash/model.py`, @07ebd93; DFlash: Block Diffusion for Flash Speculative Decoding, Chen, Liang, Liu, ICML 2026);
+read, nothing run or copied. Splash's DFlash2 port for the dense 27B (splash-m5 `runtime/model/DFlashDraft.cpp`,
+`DraftCheckpoint.cpp`, `runtime/metal/kernels/decode/draft.metal`, `sampling.metal` draft_select_*; this project's own
+work) fixed the reading of the convolution layout, the context K / V path and the selector; the kernels here are
+written for this engine's layouts.

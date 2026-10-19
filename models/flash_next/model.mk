@@ -5,7 +5,8 @@
 ENGINE_SRCS += models/flash_next/layer.mm models/flash_next/model.mm models/flash_next/mtp_loop.mm
 ENGINE_SRCS += models/flash_next/vision.mm  # lab-vision: the vision tower
 ENGINE_SRCS += models/flash_next/layer_t6.mm  # lab-t6wire: EXL3 / bf16 trunk Linears in the layer graph
-ENGINE_SRCS += models/flash_next/kvio.mm  # lab-srvcache: KV rows / recurrent state <-> host buffers (server prefix cache)
+ENGINE_SRCS += models/flash_next/kvio.mm
+ENGINE_SRCS += models/flash_next/dflash.mm  # lab-dflash: the DFlash2 block drafter (docs/mtp.md 13)  # lab-srvcache: KV rows / recurrent state <-> host buffers (server prefix cache)
 TEST_BINS += $(BUILD)/fn-layer-check
 $(BUILD)/fn-layer-check: $(BUILD)/obj/models/flash_next/fn_layer_check.mm.o $(BUILD)/libengine.dylib
 	$(CXX) $< $(LINK_ENGINE) -o $@

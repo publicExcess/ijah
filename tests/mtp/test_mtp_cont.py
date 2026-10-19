@@ -147,6 +147,7 @@ def main():
     ap.add_argument("--prefill", default="both", choices=["steps", "chunked", "both"])
     ap.add_argument("--n", type=int, default=48, help="new tokens per run")
     ap.add_argument("--depths", default="2,0")
+    ap.add_argument("--dflash", default="", help="lab-dflash: DFlash2 checkpoint dir: every check with its rounds on")
     a = ap.parse_args()
     if not a.whole and not os.environ.get("NE_FN_LAYERS"):
         sys.exit("set NE_FN_LAYERS=4 (partial model) or pass --whole")
@@ -163,6 +164,13 @@ def main():
     os.environ["NE_MTP_HEAD_KV"] = "full"  # the pre-headlazy head recordings (full layer per head step)
     MF = Mtp(eng, m)
     del os.environ["NE_MTP_HEAD_KV"]
+    if a.dflash:  # lab-dflash (docs/mtp.md 13): the block drafter drafts the rounds (greedy: 3 drafts), both loops
+        en = eng.lib.ne_fn_dfl_enable
+        en.restype, en.argtypes = C.c_int, [C.c_void_p, C.c_char_p, C.c_int, C.c_int, C.c_int, C.c_int]
+        for MM in (M, MF):
+            if en(MM.p, a.dflash.encode(), 8, 4, 8, 1):
+                raise E.EngineError(eng.last_error())
+        print(f"dflash on: {a.dflash}", flush=True)
     fails = []
 
     def check(name, ok, msg=""):
@@ -331,9 +339,12 @@ def main():
             m.reset()
             MM.feed(P)
             y = None
+            hist = list(P)  # the tokens in the state (the copy rule's history after a park, as the server passes it)
             for t in X:
+                hist.append(t)
                 y = MM.step(t)
             for _ in range(60):
+                hist.append(y)
                 y = MM.step(y)
             npend = MM.head_state()[1]
             if how == "snap":
@@ -357,6 +368,11 @@ def main():
                 MM._ok(MM.L.ne_fn_kv_io(m.ptr, 1, 0, T, kb.ctypes.data, T), "kv in")
                 MM._ok(MM.L.ne_fn_mtp_kv_io(MM.p, 1, 0, lh, hb.ctypes.data, lh), "head kv in")
                 MM._ok(MM.L.ne_fn_mtp_state_io(MM.p, 1, buf.ctypes.data, buf.nbytes, meta.ctypes.data), "state in")
+                # the copy rule knows no tokens after an import; the server gives them back (ne_fn_mtp_set_context)
+                sc = MM.L.ne_fn_mtp_set_context
+                sc.restype, sc.argtypes = C.c_int, [C.c_void_p, C.c_void_p, C.c_int]
+                hs = np.ascontiguousarray(hist, np.int32)
+                MM._ok(sc(MM.p, hs.ctypes.data, len(hs)), "set_context")
             elif how == "catch":
                 MM.catch_up()
                 npend = (npend, MM.head_state()[1])
