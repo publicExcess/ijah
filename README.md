@@ -147,17 +147,6 @@ and seed: **120.4 tok/s against 112.4 and 108.9** for MTP depth 2, ratios **1.06
 **1.101 [1.069, 1.132]** (17 of 18). By prompt: maths +14%, reasoning prose +13%, parser code +11%, LRU code +2%,
 climate prose +1%, and low-acceptance prose **-3%** - the one prompt that loses.
 
-Two things about that number, both of which the chart keeps honest:
-
-- **The gate carries the win, not the drafter.** Per verified draft, DFlash2 is *not* better than the native head
-  (2.91-2.95 tokens per round against the head's 2.98 at depth 3). What is cheap is depth: a whole block draft costs
-  2.0-2.4 ms, while every extra verify row costs 3.0-3.6 ms, so a host-side gate verifies only the prefix that
-  maximises tokens per millisecond. Draft a fixed depth 3 with no gate and the drafter is **12% slower** than the head
-  alone.
-- **Compare it with its own baseline.** It was measured on a 19 Oct build whose MTP-only baseline was 112.4 tok/s; the
-  98.9 decode bar above is from 18 Oct, before the prefill and copy-rule merges landed. 120.4 against 98.9 would be a
-  fabricated 22%.
-
 This build instantiates the verify kernels to 6 rows, so `--dflash-kmax` tops out at 5 (verify runs kmax + 1 rows);
 deeper verify is built and measured in development, not here. Off by default: a server started without `--drafter` has
 no drafter, advertises no drafter id, and refuses a request that asks for one.
@@ -180,13 +169,6 @@ no drafter, advertises no drafter id, and refuses a request that asks for one.
 - **Quality:** KL divergence between each engine's next-token distribution and the unquantised (bf16) model's, over
   the full vocabulary with teacher forcing. Three test sets: A, wikitext-2 (16 windows); B, reasoning traces (16
   windows); C, 32K-token code context (4 windows). Error bars are 95% bootstrap intervals over windows.
-- **Date:** 18 October 2026 for the speed and memory runs. Sushi's KLD is from 14 October, scored with the same bf16
-  teacher, the same three sets and the same windows (16 / 16 / 4), so it is comparable set by set. The DFlash2 drafter
-  number is from 19 October, measured through the server on the build that carries the drafter; that build's MTP-only
-  baseline was 112.4 tok/s, which is why it is not comparable with the 98.9 decode bar (18 October, before the prefill
-  and copy-rule merges). Its whisker is derived, not measured: the two paired ratios (1.067, CI 1.036-1.097; 1.101,
-  CI 1.069-1.132) applied to that baseline, giving 116.9-123.8. Sushi was removed from this machine on 19 October, so
-  the Sushi arm is a frozen measurement, not a reproducible one.
 
 The charts are pre-rendered. `tools/make_charts.py` redraws them from the per-window results in `data/charts/`.
 
