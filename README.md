@@ -119,9 +119,6 @@ and best settings.
   4-bit expert shards with Ijah's trunk; not a published pack) matches oMLX's speed.
 - **Cold prefill:** Ijah is behind oMLX, by about 12% at 10K tokens and about 27% at 32K. It is about 5% ahead of Sushi
   at 10K (2,120 vs 2,014) and level with it at 32K (2,052 vs 2,026).
-- **Memory:** in the same run the engine processes peaked at **16 GB** for Ijah, 78 GB for oMLX and 69 GB for Sushi.
-  Ijah keeps a bounded RAM cache (8 GB) in front of an SSD tier and reads the 102 GB n-gram table from disk, so it
-  serves the full 262K window without holding the weights in memory.
 - **Agent sessions:** later turns of a conversation start in about 0.2 s (exact prefix reuse). A new session's first
   turn starts in about 0.3 s when an earlier session already sent the same tool block and system prompt
   (shared-prefix snapshots).
