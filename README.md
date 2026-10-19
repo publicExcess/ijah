@@ -97,37 +97,58 @@ after a crash, and the request extensions.
 
 ## How it compares
 
-<p align="center"><img src="assets/charts/ijah-tradeoff.svg" width="640" alt="Speed versus closeness to the bf16 model: Ijah and oMLX"></p>
-<p align="center"><img src="assets/charts/ijah-speed.svg" width="820" alt="Decode and cold-prefill speed: Ijah and oMLX"></p>
-<p align="center"><img src="assets/charts/ijah-quality.svg" width="820" alt="KL divergence from the bf16 model on three test sets: Ijah and oMLX"></p>
+<p align="center"><img src="assets/charts/ijah-tradeoff.svg" width="640" alt="Speed versus closeness to the bf16 model: Ijah, oMLX and Sushi"></p>
+<p align="center"><img src="assets/charts/ijah-speed.svg" width="820" alt="Decode and cold-prefill speed: Ijah, oMLX and Sushi"></p>
+<p align="center"><img src="assets/charts/ijah-quality.svg" width="820" alt="KL divergence from the bf16 model on three test sets: Ijah, oMLX and Sushi"></p>
 
-In short, against oMLX running Jundot's Qwen3.8-Flash-Next-oQ4e:
+In short, against the two engines we ran head to head: **oMLX** with Jundot's Qwen3.8-Flash-Next-oQ4e, and **Sushi**
+with its own Sushi-4bpw pack. All three on one streaming client, the same prompts and seeds, each on its own weights
+and best settings.
 
-- **Quality:** Ijah is 4-5x closer to the bf16 model on all three test sets.
-- **Decode:** Ijah is about 6% behind oMLX with its 5-bit experts. An experiment with 4-bit experts (sushi's 4-bit
-  expert shards with Ijah's trunk; not a published pack) matches oMLX's speed.
-- **Cold prefill:** Ijah is behind oMLX, by about 12% at 10K tokens and about 27% at 32K.
+- **Quality:** Ijah is 4-5x closer to the bf16 model than oMLX on all three test sets, and 1.7-2x closer than Sushi.
+- **Decode:** Ijah is **1.16x Sushi** (95% CI 1.12-1.20, 18 of 18 pairs: 98.9 vs 85.8 tok/s), and about 6% behind oMLX
+  (0.94x, CI 0.92-0.96, 2 of 18 pairs; 105.2 tok/s) with its 5-bit experts. An experiment with 4-bit experts (sushi's
+  4-bit expert shards with Ijah's trunk; not a published pack) matches oMLX's speed.
+- **Cold prefill:** Ijah is behind oMLX, by about 12% at 10K tokens and about 27% at 32K. It is about 5% ahead of Sushi
+  at 10K (2,120 vs 2,014) and level with it at 32K (2,052 vs 2,026).
+- **Memory:** in the same run the engine processes peaked at **16 GB** for Ijah, 78 GB for oMLX and 69 GB for Sushi.
+  Ijah keeps a bounded RAM cache (8 GB) in front of an SSD tier and reads the 102 GB n-gram table from disk, so it
+  serves the full 262K window without holding the weights in memory.
 - **Agent sessions:** later turns of a conversation start in about 0.2 s (exact prefix reuse). A new session's first
   turn starts in about 0.3 s when an earlier session already sent the same tool block and system prompt
   (shared-prefix snapshots).
+
+### In the lab, not in this release
+
+One measurement in the charts is a lab build, drawn as a hollow marker: **Ijah with Inco's DFlash2 block drafter**
+(120.4 tok/s, paired +6.7% and +10.1% over MTP depth 2 on a 19 Oct build). It is a drafter *inside* the MTP loop, not
+a replacement for it. `lab/dflash` is not merged into the released tree: this repository has no `--drafter` flag, and
+`nm -gU build/libengine.dylib | grep -c dfl` returns 0. Treat the 120.4 marker as a preview, and read it against that
+build's own MTP-only baseline (112.4 tok/s), not against the 98.9 bar. Its whisker is derived, not measured: the two
+paired ratios (1.067, CI 1.036-1.097; 1.101, CI 1.069-1.132) applied to that baseline, which gives 116.9-123.8.
 
 ### How we measured
 
 - **Machine:** Apple M5 Max (40-core GPU), 128 GB, macOS 27.0.1. One engine loaded at a time, nothing else running.
 - **Compared against:** oMLX 0.7.1.dev1 with Jundot's Qwen3.8-Flash-Next-oQ4e (mixed 4–8-bit, 4.72 bits per weight),
-  using tuned settings: MTP at depth 2 and INT8-activation prefill. Ijah ran its default T6 pack (5-bit EXL3 experts,
+  using tuned settings: MTP at depth 2 and INT8-activation prefill. Sushi with its own `Qwen3.8-Flash-Next-Sushi-4bpw`
+  pack (4-bit experts, 8-bit trunk) at its default settings, MTP on. Ijah ran its default T6 pack (5-bit EXL3 experts,
   6/8-bit trunk) with MTP at depth 2. Each engine uses its own weight format, so the numbers compare
-  **engine + weights**, not the engines alone.
-- **Same client for both:** one streaming OpenAI-compatible client, the same prompts and seeds, sampling at
+  **engine + weights**, not the engines alone. The three packs sit at different quality and size points, which is why
+  the quality chart is shown beside the speed chart.
+- **Same client for all three:** one streaming OpenAI-compatible client, the same prompts and seeds, sampling at
   temperature 1.0 / top-p 0.95 / top-k 20, thinking on at medium effort.
 - **Decode:** 6 prompts (code, maths, prose) × 3 seeds, 1,024 generated tokens each. We report the mean with a 95%
-  confidence interval, and compare the two engines pair by pair on the same prompt and seed.
+  confidence interval, and compare the engines pair by pair on the same prompt and seed.
 - **Prefill:** cold prompts of 10K and 32K tokens with no cache hit, 5 runs each, timed to the first streamed token
   over HTTP. We report the median with the min–max range.
 - **Quality:** KL divergence between each engine's next-token distribution and the unquantised (bf16) model's, over
   the full vocabulary with teacher forcing. Three test sets: A, wikitext-2 (16 windows); B, reasoning traces (16
   windows); C, 32K-token code context (4 windows). Error bars are 95% bootstrap intervals over windows.
-- **Date:** 18 October 2026.
+- **Date:** 18 October 2026 for the speed and memory runs. Sushi's KLD is from 14 October, scored with the same bf16
+  teacher, the same three sets and the same windows (16 / 16 / 4), so it is comparable set by set. The DFlash2 drafter
+  marker is a 19 October lab build. Sushi was removed from this machine on 19 October, so the Sushi arm is a frozen
+  measurement, not a reproducible one.
 
 The charts are pre-rendered. `tools/make_charts.py` redraws them from the per-window results in `data/charts/`.
 
@@ -204,6 +225,8 @@ source comments name each upstream file.
   from its kernel, and our INT8-activation prefill follows its approach.
 - [TensorFold](https://github.com/ashhart/TensorFold): the MTP copy-draft rule.
 - [Splish](https://github.com/publicExcess/splish): the pruned draft vocabulary.
+- [Inco](https://inco.ai/blog/dflash2/) and [z-lab](https://github.com/z-lab/dflash) (Apache-2.0): the DFlash2 block
+  drafter measured in the lab chart (its draft model is `incoai/Qwen3.8-Flash-Next-DFlash2`). Not in this release.
 - The Qwen team, for Qwen3.8-Flash-Next (Qwen community licence).
 - UkisAI, for the Swift-1.5 fine-tune (Swift Open License 1.0, non-commercial).
 

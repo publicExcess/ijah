@@ -7,7 +7,8 @@ python3 tools/make_charts.py
 Error bars: KLD = 95% bootstrap CI of the mean over the set's windows (per-window results files below); decode = 95%
 bootstrap CI of the mean over 6 prompts x 3 seeds; prefill = median with min-max over 5 cold runs. Speed numbers are the
 18 Oct same-client runs (the head-to-head harness, not in this repository: one streaming client, same prompts and seeds,
-each engine on its own pack and best settings). Ijah vs oMLX only.
+each engine on its own pack and best settings). Ijah vs oMLX (Jundot oQ4e) and Sushi (its own Sushi-4bpw pack). The
+DFlash2 drafter marker is a 19 Oct lab build, not part of this release (see the hollow-marker footnotes).
 """
 import json
 import math
@@ -21,8 +22,9 @@ DATA = ROOT / "data" / "charts"   # per-window KLD results (paths inside scrubbe
 # engine -> (light colour, dark colour); categorical order fixed (validated: dataviz validate_palette.js, light PASS,
 # contrast WARN -> every mark is direct-labelled)
 ENG = {
-    "Ijah":  ("#eb6834", "#d95926"),
-    "oMLX":  ("#1baf7a", "#199e70"),
+    "Ijah":   ("#eb6834", "#d95926"),
+    "oMLX":   ("#1baf7a", "#199e70"),
+    "Sushi":  ("#3d7dd8", "#639bec"),
 }
 ORDER = list(ENG)
 # Ijah prefill: filled from the final same-client run after the 18 Oct prefill work (median, (min, max))
@@ -32,22 +34,28 @@ PF_IJAH_32K, PF_IJAH_32K_RNG = 2052, (2043, 2095)
 BITS = {
     "Ijah":  "5-bit EXL3 experts · 6/8-bit EXL3 trunk",
     "oMLX":  "Jundot oQ4e: mixed 4/5/6/8-bit affine (4.72 bpw)",
+    "Sushi": "Sushi-4bpw: EXL3 4-bit experts · 8-bit trunk",
 }
-SHORT = {"Ijah": "5b · 6/8b", "oMLX": "oQ4e 4.72b"}
+SHORT = {"Ijah": "5b · 6/8b", "oMLX": "oQ4e 4.72b", "Sushi": "4b · 8b"}
 
 # (value or None, tooltip note, (lo, hi) or None)
 SPEED = {
     "Decode with MTP (tok/s)": {
-        "Ijah":  (98.9, "T6 pack, MTP depth 2 (--seed-mtp), SD 10.2, range 83-119; with 4-bit experts 105.2", (94.4, 103.6)),
+        "Ijah":  (98.9, "T6 pack, MTP depth 2 (--seed-mtp), SD 10.2, range 83-119; with 4-bit experts 105.2; "
+                        "with the DFlash2 drafter 120.4 (19 Oct lab build, not in this release)", (94.4, 103.6)),
         "oMLX":  (105.2, "Jundot oQ4e, tuned settings (MTP depth 2, INT8 prefill); SD 9.2, range 91-120", (100.9, 109.2)),
+        "Sushi": (85.8, "Sushi-4bpw, its own best settings (MTP on); SD 12.1, range 67-108; paired Ijah/Sushi "
+                        "1.162 (CI 1.122-1.203), 18/18 wins", (80.4, 91.1)),
     },
     "Prefill, 10K-token prompt (tok/s)": {
         "Ijah":  (PF_IJAH_10K, "master after the 18 Oct prefill work, cold, 5 runs", PF_IJAH_10K_RNG),
         "oMLX":  (2412, "Jundot oQ4e, INT8-activation prefill, cold, 5 runs (first run 1,419: warm-up)", (1419, 2632)),
+        "Sushi": (2014, "Sushi-4bpw, cold, 5 runs", (1949, 2028)),
     },
     "Prefill, 32K-token prompt (tok/s)": {
         "Ijah":  (PF_IJAH_32K, "master after the 18 Oct prefill work, cold, 5 runs", PF_IJAH_32K_RNG),
         "oMLX":  (2812, "Jundot oQ4e, INT8-activation prefill, cold, 5 runs", (2778, 2838)),
+        "Sushi": (2026, "Sushi-4bpw, cold, 5 runs", (2021, 2050)),
     },
 }
 
@@ -58,10 +66,12 @@ KLD_SRC = {
               "B": (DATA / "kld-master-1716-T6-B.json", "B"),
               "C": (DATA / "kld-t6fuse-T6-f32.json", "C")},
     "oMLX":  {s: (DATA / "kld-L48-oq4e.json", s) for s in "ABC"},
+    "Sushi": {s: (DATA / "kld-L48-sushi.json", s) for s in "ABC"},
 }
 KLD_NOTE = {
     "Ijah":  "T6 pack: EXL3 K5 experts + K6/K8 trunk + bf16 mixer",
     "oMLX":  "Jundot oQ4e, scored through oMLX's own loader (omlx_kld.py)",
+    "Sushi": "Sushi-4bpw (4-bit experts, 8-bit trunk), scored through Sushi's own loader",
 }
 SETS = (("A", "A · wikitext"), ("B", "B · reasoning"), ("C", "C · 32K context"))
 
@@ -133,10 +143,10 @@ def legend(y):
 
 def speed_chart():
     W, panel_h, top = 1040, 120, 126
-    H = top + panel_h + 92
+    H = top + panel_h + 178
     pw, gx = 300, 30
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" '
-           f'aria-label="Ijah vs oMLX: decode and prefill speed">', style(),
+           f'aria-label="Ijah, oMLX and Sushi: decode and prefill speed">', style(),
            f'<rect class="bg" width="{W}" height="{H}" rx="16"/>',
            f'<text class="t1" x="40" y="48" font-size="24" font-weight="700">Speed · Qwen3.8-Flash-Next on an M5 Max</text>',
            f'<text class="t2" x="40" y="72" font-size="14">Single stream, tokens per second, higher is better. '
@@ -175,12 +185,17 @@ def speed_chart():
             out.append(f'<text class="t1" x="{lx:.1f}" y="{by + 20}" font-size="13" '
                        f'font-weight="{700 if e == "Ijah" else 500}">{fmt(v)}</text>')
     for k, line in enumerate((
-            "Decode: mean of 6 prompts x 3 seeds (1,024 tokens, T=1, medium thinking), whiskers = 95% CI; paired, Ijah is "
-            "6% behind oMLX (CI 4-8%).",
+            "Decode: mean of 6 prompts x 3 seeds (1,024 tokens, T=1, medium thinking), whiskers = 95% CI.",
+            "Paired on the same prompt and seed: Ijah is 1.162x Sushi (CI 1.122-1.203, 18/18 wins) and 0.94x oMLX "
+            "(CI 0.92-0.96, 2/18).",
             "Prefill: cold prompts with no cache hit, median of 5 runs, whiskers = min-max.",
-            "One streaming client for both, each on its own weights and best settings (oMLX: MTP depth 2, INT8-activation prefill);",
-            "18 Oct 2026, M5 Max 128 GB.")):
-        out.append(f'<text class="t3" x="40" y="{H - 72 + 17 * k}" font-size="11.5">{esc(line)}</text>')
+            "One streaming client for all three, each on its own weights and best settings (oMLX: MTP depth 2, "
+            "INT8-activation prefill).",
+            "Engine + weights, not engine alone: Sushi ran its 4-bit-expert Sushi-4bpw pack, oMLX the 4.72 bpw oQ4e, "
+            "Ijah its 5-bit-expert T6 pack.",
+            "18 Oct 2026, M5 Max 128 GB. Ijah with the DFlash2 drafter measured 120.4 tok/s on a 19 Oct lab build "
+            "(not in this release).")):
+        out.append(f'<text class="t3" x="40" y="{H - 124 + 17 * k}" font-size="11.5">{esc(line)}</text>')
     out.append("</svg>")
     return "\n".join(out)
 
@@ -188,7 +203,7 @@ def speed_chart():
 def kld_chart(st):
     W, H = 1000, 488
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {W} {H}" width="{W}" height="{H}" role="img" '
-           f'aria-label="Quality: KL divergence from the bf16 model, Ijah vs oMLX">', style(),
+           f'aria-label="Quality: KL divergence from the bf16 model, Ijah, oMLX and Sushi">', style(),
            f'<rect class="bg" width="{W}" height="{H}" rx="16"/>',
            f'<text class="t1" x="40" y="48" font-size="24" font-weight="700">Quality · distance from the full-precision model</text>',
            f'<text class="t2" x="40" y="72" font-size="14">KL divergence from the bf16 teacher on three test sets, '
@@ -225,17 +240,17 @@ def kld_chart(st):
     ns = sorted({st[e][k][4] for e in st for k, _ in SETS})
     out.append(f'<text class="t3" x="40" y="{H - 30}" font-size="11.5">Whiskers: 95% bootstrap confidence interval of '
                f'the mean over each set\'s windows (n = {", ".join(map(str, ns))}); hover a bar for the SD.</text>')
-    out.append(f'<text class="t3" x="40" y="{H - 13}" font-size="11.5">Ijah is 4-5x closer than '
-               f'oMLX\'s Jundot oQ4e on every set.</text>')
+    out.append(f'<text class="t3" x="40" y="{H - 13}" font-size="11.5">Ijah is 1.7-2x closer than '
+               f'Sushi\'s 4bpw pack, and 4-5x closer than oMLX\'s Jundot oQ4e, on every set.</text>')
     out.append("</svg>")
     return "\n".join(out)
 
 
 def tradeoff_chart(st):
     """speed vs quality: x = decode with MTP, y = KLD set B (log), bottom-right is best"""
-    W, H = 800, 500
+    W, H = 800, 520
     x0, x1, y0, y1 = 96, 740, 410, 130
-    xmin, xmax = 88, 114
+    xmin, xmax = 82, 126
     lmin, lmax = math.log10(0.006), math.log10(0.08)
     X = lambda v: x0 + (v - xmin) / (xmax - xmin) * (x1 - x0)
     Y = lambda v: y0 - (math.log10(v) - lmin) / (lmax - lmin) * (y0 - y1)
@@ -244,7 +259,7 @@ def tradeoff_chart(st):
            f'<text class="t1" x="40" y="48" font-size="24" font-weight="700">Faster and closer</text>',
            f'<text class="t2" x="40" y="72" font-size="14">Decode speed with MTP vs distance from the bf16 model '
            f'(set B, log scale). Best is bottom-right.</text>']
-    for v in (90, 95, 100, 105, 110):
+    for v in (85, 90, 95, 100, 105, 110, 115, 120):
         out.append(f'<line class="grid" x1="{X(v):.1f}" y1="{y1}" x2="{X(v):.1f}" y2="{y0}" stroke-width="1"/>')
         out.append(f'<text class="t3" x="{X(v):.1f}" y="{y0 + 20}" font-size="11" text-anchor="middle">{v}</text>')
     for v in (0.01, 0.02, 0.05):
@@ -255,7 +270,7 @@ def tradeoff_chart(st):
     out.append(f'<text class="t2" x="28" y="{(y0 + y1) / 2}" font-size="12.5" text-anchor="middle" '
                f'transform="rotate(-90 28 {(y0 + y1) / 2})">← closer to bf16 (KLD, set B)</text>')
     dec = SPEED["Decode with MTP (tok/s)"]
-    for e in ("oMLX", "Ijah"):
+    for e in ("Sushi", "oMLX", "Ijah"):
         sv, _, rng = dec[e]
         m, lo, hi, sd, n = st[e]["B"]
         cx, cy = X(sv), Y(m)
@@ -286,10 +301,20 @@ def tradeoff_chart(st):
                f'[{b4[100]:.4f}, {b4[3899]:.4f}] (Sushi-4bpw expert shards + Ijah\'s T6 trunk)</title></circle>')
     out.append(f'<text class="t1" x="{cx - 12:.1f}" y="{cy + 22:.1f}" font-size="13" text-anchor="end" {halo}>'
                f'Ijah, 4-bit experts (experiment)</text>')
-    out.append(f'<text class="t3" x="40" y="{H - 30}" font-size="11.5">Whiskers: decode 95% CI over 6 prompts x 3 seeds '
+    # Ijah + the DFlash2 block drafter (same T6 pack, so the same quality): hollow marker, same colour
+    cx, cy = X(120.4), Y(st["Ijah"]["B"][0])
+    out.append(hwhisker(X(116.9), X(123.8), cy, cap=5))
+    out.append(f'<circle class="s-Ijah" cx="{cx:.1f}" cy="{cy:.1f}" r="9" fill="none" stroke-width="3" '
+               f'stroke-dasharray="3 3"><title>Ijah with the DFlash2 drafter: 120.4 tok/s (95% CI 116.9-123.8), same T6 '
+               f'pack so the same KLD {st["Ijah"]["B"][0]:.4f}; 19 Oct lab build, not in this release</title></circle>')
+    out.append(f'<text class="t1" x="{cx - 12:.1f}" y="{cy + 40:.1f}" font-size="13" text-anchor="end" {halo}>'
+               f'Ijah + DFlash2 drafter (lab build)</text>')
+    out.append(f'<text class="t3" x="40" y="{H - 52}" font-size="11.5">Whiskers: decode 95% CI over 6 prompts x 3 seeds '
                f'(same client); KLD 95% bootstrap CI over windows.</text>')
-    out.append(f'<text class="t3" x="40" y="{H - 13}" font-size="11.5">Hollow marker: an experiment with 4-bit experts '
-               f'(not a published pack); the default Ijah pack uses 5-bit experts.</text>')
+    out.append(f'<text class="t3" x="40" y="{H - 35}" font-size="11.5">Hollow markers are lab work, not this release: '
+               f'4-bit experts (not a published pack) and the DFlash2 drafter (not in this tree).</text>')
+    out.append(f'<text class="t3" x="40" y="{H - 18}" font-size="11.5">The DFlash2 point is a 19 Oct build, whose MTP-only '
+               f'baseline was 112.4 tok/s: read it against that, not against the 98.9 bar.</text>')
     out.append("</svg>")
     return "\n".join(out)
 
