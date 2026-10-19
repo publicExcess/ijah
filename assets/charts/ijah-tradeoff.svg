@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" width="800" height="500" role="img" aria-label="Speed versus quality">
+<style>
+  .bg{fill:#fcfcfb} .t1{fill:#1f1d1b} .t2{fill:#5d5a55} .t3{fill:#8a867f} .grid{stroke:#e7e4de}
+  .axis{stroke:#bdb8b0} .na{fill:#f1eee8;stroke:#d9d4cb} .gap{stroke:#fcfcfb} .err{stroke:#3a3632}
+  text{font-family:-apple-system, BlinkMacSystemFont, 'Helvetica Neue', Arial, sans-serif} .c-Ijah{fill:#eb6834}.s-Ijah{stroke:#eb6834}.c-oMLX{fill:#1baf7a}.s-oMLX{stroke:#1baf7a}
+  @media (prefers-color-scheme: dark) {
+    .bg{fill:#1a1a19} .t1{fill:#f0efec} .t2{fill:#c3c2b7} .t3{fill:#8f8d86} .grid{stroke:#2c2b29}
+    .axis{stroke:#4a4844} .na{fill:#242322;stroke:#3a3936} .gap{stroke:#1a1a19} .err{stroke:#e6e3dc} .c-Ijah{fill:#d95926}.s-Ijah{stroke:#d95926}.c-oMLX{fill:#199e70}.s-oMLX{stroke:#199e70}
+  }
+</style>
+<rect class="bg" width="800" height="500" rx="16"/>
+<text class="t1" x="40" y="48" font-size="24" font-weight="700">Faster and closer</text>
+<text class="t2" x="40" y="72" font-size="14">Decode speed with MTP vs distance from the bf16 model (set B, log scale). Best is bottom-right.</text>
+<line class="grid" x1="145.5" y1="130" x2="145.5" y2="410" stroke-width="1"/>
+<text class="t3" x="145.5" y="430" font-size="11" text-anchor="middle">90</text>
+<line class="grid" x1="269.4" y1="130" x2="269.4" y2="410" stroke-width="1"/>
+<text class="t3" x="269.4" y="430" font-size="11" text-anchor="middle">95</text>
+<line class="grid" x1="393.2" y1="130" x2="393.2" y2="410" stroke-width="1"/>
+<text class="t3" x="393.2" y="430" font-size="11" text-anchor="middle">100</text>
+<line class="grid" x1="517.1" y1="130" x2="517.1" y2="410" stroke-width="1"/>
+<text class="t3" x="517.1" y="430" font-size="11" text-anchor="middle">105</text>
+<line class="grid" x1="640.9" y1="130" x2="640.9" y2="410" stroke-width="1"/>
+<text class="t3" x="640.9" y="430" font-size="11" text-anchor="middle">110</text>
+<line class="grid" x1="96" y1="354.8" x2="740" y2="354.8" stroke-width="1"/>
+<text class="t3" x="88" y="358.8" font-size="11" text-anchor="end">0.01</text>
+<line class="grid" x1="96" y1="279.9" x2="740" y2="279.9" stroke-width="1"/>
+<text class="t3" x="88" y="283.9" font-size="11" text-anchor="end">0.02</text>
+<line class="grid" x1="96" y1="180.8" x2="740" y2="180.8" stroke-width="1"/>
+<text class="t3" x="88" y="184.8" font-size="11" text-anchor="end">0.05</text>
+<text class="t2" x="418.0" y="454" font-size="12.5" text-anchor="middle">decode with MTP, tokens per second →</text>
+<text class="t2" x="28" y="270.0" font-size="12.5" text-anchor="middle" transform="rotate(-90 28 270.0)">← closer to bf16 (KLD, set B)</text>
+<line class="err" x1="415.5" y1="216.3" x2="621.1" y2="216.3" stroke-width="1.5"/><line class="err" x1="415.5" y1="211.3" x2="415.5" y2="221.3" stroke-width="1.5"/><line class="err" x1="621.1" y1="211.3" x2="621.1" y2="221.3" stroke-width="1.5"/>
+<line class="err" x1="522.0" y1="232.2" x2="522.0" y2="201.5" stroke-width="1.5"/><line class="err" x1="517.0" y1="232.2" x2="527.0" y2="232.2" stroke-width="1.5"/><line class="err" x1="517.0" y1="201.5" x2="527.0" y2="201.5" stroke-width="1.5"/>
+<circle class="c-oMLX gap" cx="522.0" cy="216.3" r="9" stroke-width="2"><title>oMLX: 105.2 tok/s (95% CI 100.9-109.2), KLD 0.0360 [0.0311, 0.0413] — Jundot oQ4e: mixed 4/5/6/8-bit affine (4.72 bpw)</title></circle>
+<text class="t1" x="507.0" y="191.3" font-size="14" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke" text-anchor="end" font-weight="500">oMLX</text><text class="t3" x="507.0" y="204.3" font-size="10.5" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke" text-anchor="end">Jundot oQ4e: mixed 4/5/6/8-bit affine (4.72 bpw)</text>
+<line class="err" x1="254.5" y1="364.1" x2="482.4" y2="364.1" stroke-width="1.5"/><line class="err" x1="254.5" y1="359.1" x2="254.5" y2="369.1" stroke-width="1.5"/><line class="err" x1="482.4" y1="359.1" x2="482.4" y2="369.1" stroke-width="1.5"/>
+<line class="err" x1="366.0" y1="390.4" x2="366.0" y2="340.3" stroke-width="1.5"/><line class="err" x1="361.0" y1="390.4" x2="371.0" y2="390.4" stroke-width="1.5"/><line class="err" x1="361.0" y1="340.3" x2="371.0" y2="340.3" stroke-width="1.5"/>
+<circle class="c-Ijah gap" cx="366.0" cy="364.1" r="12" stroke-width="2"><title>Ijah: 98.9 tok/s (95% CI 94.4-103.6), KLD 0.0092 [0.0072, 0.0114] — 5-bit EXL3 experts · 6/8-bit EXL3 trunk</title></circle>
+<text class="t1" x="384.0" y="336.1" font-size="14" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke" font-weight="700">Ijah</text><text class="t3" x="384.0" y="349.1" font-size="10.5" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">5-bit EXL3 experts · 6/8-bit EXL3 trunk</text>
+<line class="err" x1="418.0" y1="288.1" x2="623.6" y2="288.1" stroke-width="1.5"/><line class="err" x1="418.0" y1="283.1" x2="418.0" y2="293.1" stroke-width="1.5"/><line class="err" x1="623.6" y1="283.1" x2="623.6" y2="293.1" stroke-width="1.5"/>
+<line class="err" x1="522.0" y1="321.2" x2="522.0" y2="251.6" stroke-width="1.5"/><line class="err" x1="517.0" y1="321.2" x2="527.0" y2="321.2" stroke-width="1.5"/><line class="err" x1="517.0" y1="251.6" x2="527.0" y2="251.6" stroke-width="1.5"/>
+<circle class="s-Ijah" cx="522.0" cy="288.1" r="9" fill="none" stroke-width="3"><title>Ijah with 4-bit experts: 105.2 tok/s (95% CI 101.0-109.3), KLD 0.0185 [0.0136, 0.0260] (Sushi-4bpw expert shards + Ijah's T6 trunk)</title></circle>
+<text class="t1" x="510.0" y="310.1" font-size="13" text-anchor="end" stroke="#fcfcfb" stroke-width="5" stroke-linejoin="round" paint-order="stroke">Ijah, 4-bit experts (experiment)</text>
+<text class="t3" x="40" y="470" font-size="11.5">Whiskers: decode 95% CI over 6 prompts x 3 seeds (same client); KLD 95% bootstrap CI over windows.</text>
+<text class="t3" x="40" y="487" font-size="11.5">Hollow marker: an experiment with 4-bit experts (not a published pack); the default Ijah pack uses 5-bit experts.</text>
+</svg>

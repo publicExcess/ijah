@@ -1,0 +1,675 @@
+{
+ "step": "decode1",
+ "rows": 1,
+ "position_start": 48,
+ "token_ids": [
+  539
+ ],
+ "cache_len_in": 48,
+ "attn_path": "gdn",
+ "mask": "None",
+ "prompt_token_ids": [
+  760,
+  7905,
+  380,
+  20,
+  7252,
+  682,
+  264,
+  41275,
+  4779,
+  17120,
+  25,
+  279,
+  13540,
+  321,
+  279,
+  21966,
+  4191,
+  799,
+  7087,
+  314,
+  4778,
+  4779,
+  11,
+  748,
+  264,
+  3349,
+  3992,
+  1558,
+  628,
+  381,
+  4779,
+  1395,
+  5499,
+  2957,
+  321,
+  1301,
+  539,
+  18626,
+  61369,
+  1973,
+  10672,
+  13,
+  3588,
+  3574,
+  799,
+  3817,
+  369,
+  6608
+ ],
+ "case": "L00_decode1",
+ "layer": 0,
+ "layer_type": "linear_attention",
+ "has_ple": false,
+ "pack": "~/.cache/ijah/packs/Qwen3.8-Flash-Next-EXL3-K5",
+ "bytes": 7110036,
+ "tensors": {
+  "embed": {
+   "file": "embed.npy",
+   "shape": [
+    1,
+    1,
+    2560
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "token embedding (8-bit g64 QuantizedEmbedding), before the x4 tile",
+   "pack_weights": [
+    "language_model.model.embed_tokens"
+   ]
+  },
+  "hc_in": {
+   "file": "hc_in.npy",
+   "shape": [
+    1,
+    1,
+    10240
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "decoder-layer input: 4 hyper-connection streams [.., 4*2560] (stream s = cols s*2560..)",
+   "pack_weights": []
+  },
+  "attn_hc.normed": {
+   "file": "attn_hc.normed.npy",
+   "shape": [
+    1,
+    1,
+    10240
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "hc_norm(h): RMSNorm per stream (groups of 2560) [.., 10240]",
+   "pack_weights": [
+    "language_model.model.layers.0.attn_hyper_connection.hc_norm.weight"
+   ]
+  },
+  "attn_hc.down": {
+   "file": "attn_hc.down.npy",
+   "shape": [
+    1,
+    1,
+    320
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "input_mix_weight_down(normed) [.., 320]",
+   "pack_weights": [
+    "language_model.model.layers.0.attn_hyper_connection.input_mix_weight_down"
+   ]
+  },
+  "attn_hc.mix": {
+   "file": "attn_hc.mix.npy",
+   "shape": [
+    1,
+    1,
+    320
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "silu(down / 4) [.., 320]",
+   "pack_weights": []
+  },
+  "attn_hc.up": {
+   "file": "attn_hc.up.npy",
+   "shape": [
+    1,
+    1,
+    10240
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "input_mix_weight_up(mix) [.., 10240]",
+   "pack_weights": [
+    "language_model.model.layers.0.attn_hyper_connection.input_mix_weight_up"
+   ]
+  },
+  "attn_hc.block_in": {
+   "file": "attn_hc.block_in.npy",
+   "shape": [
+    1,
+    1,
+    2560
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "HC read output = mean_s(sigmoid(up_s) * normed_s) [.., 2560]: the attention/GDN input",
+   "pack_weights": []
+  },
+  "attn_hc.inject_logits": {
+   "file": "attn_hc.inject_logits.npy",
+   "shape": [
+    1,
+    1,
+    4
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "block_inject_weight(normed) [.., 4]",
+   "pack_weights": [
+    "language_model.model.layers.0.attn_hyper_connection.block_inject_weight.weight"
+   ]
+  },
+  "attn_hc.inject_w": {
+   "file": "attn_hc.inject_w.npy",
+   "shape": [
+    1,
+    1,
+    4
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "2 * sigmoid(inject_logits / 4) [.., 4]",
+   "pack_weights": []
+  },
+  "gdn.qkv": {
+   "file": "gdn.qkv.npy",
+   "shape": [
+    1,
+    1,
+    10240
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "in_proj_qkv(x) [.., 10240] = q 2048 | k 2048 | v 6144",
+   "pack_weights": [
+    "language_model.model.layers.0.linear_attn.in_proj_qkv"
+   ]
+  },
+  "gdn.z": {
+   "file": "gdn.z.npy",
+   "shape": [
+    1,
+    1,
+    6144
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "in_proj_z(x) [.., 6144] (48 v-heads x 128)",
+   "pack_weights": [
+    "language_model.model.layers.0.linear_attn.in_proj_z"
+   ]
+  },
+  "gdn.a": {
+   "file": "gdn.a.npy",
+   "shape": [
+    1,
+    1,
+    48
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "in_proj_a(x) [.., 48]",
+   "pack_weights": [
+    "language_model.model.layers.0.linear_attn.in_proj_a"
+   ]
+  },
+  "gdn.b": {
+   "file": "gdn.b.npy",
+   "shape": [
+    1,
+    1,
+    48
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "in_proj_b(x) [.., 48]",
+   "pack_weights": [
+    "language_model.model.layers.0.linear_attn.in_proj_b"
+   ]
+  },
+  "gdn.conv_state_in": {
+   "file": "gdn.conv_state_in.npy",
+   "shape": [
+    1,
+    3,
+    10240
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "GDN cache[0]: last 3 qkv rows [1, 3, 10240]",
+   "pack_weights": []
+  },
+  "gdn.conv_state_out": {
+   "file": "gdn.conv_state_out.npy",
+   "shape": [
+    1,
+    3,
+    10240
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "GDN cache[0] after the step",
+   "pack_weights": []
+  },
+  "gdn.conv_out": {
+   "file": "gdn.conv_out.npy",
+   "shape": [
+    1,
+    1,
+    10240
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "silu(depthwise causal conv K=4 over [state; qkv]) [.., 10240]",
+   "pack_weights": [
+    "language_model.model.layers.0.linear_attn.conv1d.weight"
+   ]
+  },
+  "gdn.q": {
+   "file": "gdn.q.npy",
+   "shape": [
+    1,
+    1,
+    16,
+    128
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "L2-normalised q * 128^-0.5 [.., 16, 128]",
+   "pack_weights": []
+  },
+  "gdn.k": {
+   "file": "gdn.k.npy",
+   "shape": [
+    1,
+    1,
+    16,
+    128
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "L2-normalised k [.., 16, 128]",
+   "pack_weights": []
+  },
+  "gdn.v": {
+   "file": "gdn.v.npy",
+   "shape": [
+    1,
+    1,
+    48,
+    128
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "v [.., 48, 128] (slice of conv_out)",
+   "pack_weights": []
+  },
+  "gdn.g": {
+   "file": "gdn.g.npy",
+   "shape": [
+    1,
+    1,
+    48
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "float32",
+   "desc": "decay exp(-exp(A_log) * softplus(a + dt_bias)) [.., 48] f32",
+   "pack_weights": [
+    "language_model.model.layers.0.linear_attn.A_log",
+    "language_model.model.layers.0.linear_attn.dt_bias"
+   ]
+  },
+  "gdn.beta": {
+   "file": "gdn.beta.npy",
+   "shape": [
+    1,
+    1,
+    48
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "sigmoid(b) [.., 48]",
+   "pack_weights": []
+  },
+  "gdn.ssm_state_in": {
+   "file": "gdn.ssm_state_in.npy",
+   "shape": [
+    1,
+    48,
+    128,
+    128
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "float32",
+   "desc": "GDN cache[1]: recurrent state [1, 48, 128(v), 128(k)] f32",
+   "pack_weights": []
+  },
+  "gdn.core_out": {
+   "file": "gdn.core_out.npy",
+   "shape": [
+    1,
+    1,
+    48,
+    128
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "gated-delta output y [.., 48, 128]",
+   "pack_weights": []
+  },
+  "gdn.ssm_state_out": {
+   "file": "gdn.ssm_state_out.npy",
+   "shape": [
+    1,
+    48,
+    128,
+    128
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "float32",
+   "desc": "GDN cache[1] after the step",
+   "pack_weights": []
+  },
+  "gdn.gated_norm": {
+   "file": "gdn.gated_norm.npy",
+   "shape": [
+    1,
+    1,
+    48,
+    128
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "rms_norm(y) * norm.weight * sigmoid(z) per v-head [.., 48, 128]",
+   "pack_weights": [
+    "language_model.model.layers.0.linear_attn.norm.weight"
+   ]
+  },
+  "gdn.out": {
+   "file": "gdn.out.npy",
+   "shape": [
+    1,
+    1,
+    2560
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "out_proj(gated_norm) [.., 2560]: the branch",
+   "pack_weights": [
+    "language_model.model.layers.0.linear_attn.out_proj"
+   ]
+  },
+  "attn_hc.out": {
+   "file": "attn_hc.out.npy",
+   "shape": [
+    1,
+    1,
+    10240
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "HC write: h + branch[.., None, :] * inject_w[.., :, None] [.., 10240]",
+   "pack_weights": []
+  },
+  "mlp_hc.normed": {
+   "file": "mlp_hc.normed.npy",
+   "shape": [
+    1,
+    1,
+    10240
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "hc_norm(h) [.., 10240]",
+   "pack_weights": [
+    "language_model.model.layers.0.mlp_hyper_connection.hc_norm.weight"
+   ]
+  },
+  "mlp_hc.down": {
+   "file": "mlp_hc.down.npy",
+   "shape": [
+    1,
+    1,
+    320
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "input_mix_weight_down(normed) [.., 320]",
+   "pack_weights": [
+    "language_model.model.layers.0.mlp_hyper_connection.input_mix_weight_down"
+   ]
+  },
+  "mlp_hc.mix": {
+   "file": "mlp_hc.mix.npy",
+   "shape": [
+    1,
+    1,
+    320
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "silu(down / 4)",
+   "pack_weights": []
+  },
+  "mlp_hc.up": {
+   "file": "mlp_hc.up.npy",
+   "shape": [
+    1,
+    1,
+    10240
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "input_mix_weight_up(mix) [.., 10240]",
+   "pack_weights": [
+    "language_model.model.layers.0.mlp_hyper_connection.input_mix_weight_up"
+   ]
+  },
+  "mlp_hc.block_in": {
+   "file": "mlp_hc.block_in.npy",
+   "shape": [
+    1,
+    1,
+    2560
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "HC read output: the MoE input [.., 2560]",
+   "pack_weights": []
+  },
+  "mlp_hc.inject_logits": {
+   "file": "mlp_hc.inject_logits.npy",
+   "shape": [
+    1,
+    1,
+    4
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "block_inject_weight(normed) [.., 4]",
+   "pack_weights": [
+    "language_model.model.layers.0.mlp_hyper_connection.block_inject_weight.weight"
+   ]
+  },
+  "mlp_hc.inject_w": {
+   "file": "mlp_hc.inject_w.npy",
+   "shape": [
+    1,
+    1,
+    4
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "2 * sigmoid(inject_logits / 4)",
+   "pack_weights": []
+  },
+  "moe.router_logits": {
+   "file": "moe.router_logits.npy",
+   "shape": [
+    1,
+    1,
+    512
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "gate(x) [.., 512] (bf16 Linear)",
+   "pack_weights": [
+    "language_model.model.layers.0.mlp.gate.weight"
+   ]
+  },
+  "moe.router_probs": {
+   "file": "moe.router_probs.npy",
+   "shape": [
+    1,
+    1,
+    512
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "softmax(router_logits, precise) [.., 512]",
+   "pack_weights": []
+  },
+  "moe.topk_ids": {
+   "file": "moe.topk_ids.npy",
+   "shape": [
+    1,
+    1,
+    10
+   ],
+   "saved_dtype": "int32",
+   "ref_dtype": "int32",
+   "desc": "top-10 expert ids [.., 10] (argpartition order: a SET, order is not meaningful)",
+   "pack_weights": []
+  },
+  "moe.topk_weights": {
+   "file": "moe.topk_weights.npy",
+   "shape": [
+    1,
+    1,
+    10
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "renormalised top-10 probs [.., 10], same order as topk_ids",
+   "pack_weights": []
+  },
+  "moe.routed_out": {
+   "file": "moe.routed_out.npy",
+   "shape": [
+    1,
+    1,
+    2560
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "sum_k w_k * expert_k(x) on the EXL3 kernels [.., 2560]",
+   "pack_weights": [
+    "language_model.model.layers.0.mlp.switch_mlp.{gate,up,down}_proj.{trellis,suh,svh}"
+   ]
+  },
+  "moe.shared_gate_proj": {
+   "file": "moe.shared_gate_proj.npy",
+   "shape": [
+    1,
+    1,
+    640
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "shared_expert.gate_proj(x) [.., 640]",
+   "pack_weights": [
+    "language_model.model.layers.0.mlp.shared_expert.gate_proj"
+   ]
+  },
+  "moe.shared_up_proj": {
+   "file": "moe.shared_up_proj.npy",
+   "shape": [
+    1,
+    1,
+    640
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "shared_expert.up_proj(x) [.., 640]",
+   "pack_weights": [
+    "language_model.model.layers.0.mlp.shared_expert.up_proj"
+   ]
+  },
+  "moe.shared_act": {
+   "file": "moe.shared_act.npy",
+   "shape": [
+    1,
+    1,
+    640
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "silu(gate) * up [.., 640]",
+   "pack_weights": []
+  },
+  "moe.shared_out": {
+   "file": "moe.shared_out.npy",
+   "shape": [
+    1,
+    1,
+    2560
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "shared_expert(x) = down_proj(act) [.., 2560]",
+   "pack_weights": [
+    "language_model.model.layers.0.mlp.shared_expert.down_proj"
+   ]
+  },
+  "moe.shared_scale": {
+   "file": "moe.shared_scale.npy",
+   "shape": [
+    1,
+    1,
+    1
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "sigmoid(shared_expert_gate(x)) [.., 1]",
+   "pack_weights": [
+    "language_model.model.layers.0.mlp.shared_expert_gate.weight"
+   ]
+  },
+  "moe.out": {
+   "file": "moe.out.npy",
+   "shape": [
+    1,
+    1,
+    2560
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "routed_out + shared_scale * shared_out [.., 2560]: the branch",
+   "pack_weights": []
+  },
+  "hc_out": {
+   "file": "hc_out.npy",
+   "shape": [
+    1,
+    1,
+    10240
+   ],
+   "saved_dtype": "float32",
+   "ref_dtype": "bfloat16",
+   "desc": "decoder-layer output streams [.., 10240] (= next layer's hc_in)",
+   "pack_weights": []
+  }
+ }
+}

@@ -1,0 +1,32 @@
+Ijah
+Copyright 2026 publicExcess and contributors
+https://github.com/publicExcess/ijah
+
+Licensed under the Apache License, Version 2.0 (LICENSE).
+
+This product includes or adapts third-party material that remains under its own licence. The full licence texts and
+copyright lines are in THIRD_PARTY_NOTICES.md; the source comments at each site name their upstream too.
+
+- MLX (https://github.com/ml-explore/mlx), MIT License, Copyright (c) 2023 Apple Inc.: NAX steel GEMM / attention
+  headers vendored in kernels/prefill/mlx/ (with LICENSE.mlx); erf / expm1f in kernels/vision/vision.metal; the kv8
+  quantizer in kernels/attn/qsa.metal reproduces affine_quantize.
+- expm1f, BSD 2-Clause License, Copyright (c) 2015-2023 Norbert Juffa (through MLX): kernels/vision/vision.metal.
+- sushi (https://github.com/beamivalice/sushi), MIT License, Copyright (c) 2026 Theinruj Toranavikrai, Copyright (c)
+  2026 David Dalcu: the EXL3 MoE prefill GEMM body and trellis fragment decode (kernels/prefill/pf_moe.metal), the
+  pipelined gated-delta scan (kernels/prefill/pf_gdn_pipe.metal), and the EXL3 decode rule / tensor-core slot order /
+  FWHT (kernels/ne_common.h, kernels/trunk6/trunk6.metal), the QSA radix select (kernels/attn/qsa.metal) and the NAX
+  operand lane layout (kernels/nax/nax_q8.metal) follow it.
+- exllamav3 (https://github.com/turboderp-org/exllamav3), MIT License, Copyright (c) 2025 Turboderp: the EXL3 trellis
+  format (MCG codebook, bit layout); tools/convert_trunk_enc.py re-implements its quantize_exl3 recipe.
+- mlx-vlm (https://github.com/Blaizzy/mlx-vlm), MIT License, Copyright (c) 2025 Prince Canuma: server/vision.py ports
+  its Qwen3-VL image preprocessing and positions; the model math follows its qwen4_exp / MTP drafter reference.
+- oMLX (https://github.com/jundot/omlx), Apache License 2.0, Copyright 2025 oMLX contributors: the pipelined
+  gated-delta scan in kernels/prefill/pf_gdn_pipe.metal derives (through sushi) from oMLX's gated_delta_pipelined;
+  the INT8-activation prefill and the norm-inject fold follow oMLX's ideas (no oMLX code).
+- Splish (https://github.com/publicExcess/splish), Apache License 2.0: models/flash_next/draft_vocab.h is copied from
+  Splish's DraftVocab.hpp (written by publicExcess).
+- TensorFold (https://github.com/ashhart/TensorFold), Copyright 2026 TensorFold contributors: the MTP copy-draft rule
+  and the 98,304-id draft-vocabulary prefix follow its design (no TensorFold code).
+
+Model weights are not part of this repository. The packs on Hugging Face (SiliconSpecies/Qwen3.8-Flash-Next-EXL3-Ijah,
+SiliconSpecies/Swift-1.5-Flash-Next-EXL3-Ijah) carry their own licences; see their model cards.

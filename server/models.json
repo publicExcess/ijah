@@ -1,0 +1,8 @@
+{
+ "_doc": "Model ids the server can serve (docs/server.md 1b). --model-id ID picks the first pack of ID's list that is complete; --pack DIR overrides. '@IJAH_PACKS/' = the packs directory (env IJAH_PACKS, default ~/.cache/ijah/packs); download a pack with: hf download SiliconSpecies/<name> --local-dir <IJAH_PACKS>/<name>. A pack with trunk6 metadata is complete when all 48 layers are converted and the bf16 mixer is in.",
+ "default": "Qwen3.8-Flash-Next-native",
+ "models": {
+  "Qwen3.8-Flash-Next-native": {"packs": ["@IJAH_PACKS/Qwen3.8-Flash-Next-EXL3-Ijah"]},
+  "Swift-1.5-Flash-Next-native": {"packs": ["@IJAH_PACKS/Swift-1.5-Flash-Next-EXL3-Ijah"]}
+ }
+}

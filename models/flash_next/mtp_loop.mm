@@ -1,0 +1,1393 @@
+// Flash-Next MTP token loop (lab-loop). Header: mtp_loop.h; design and numbers: docs/mtp.md section 10.
+#include "models/flash_next/mtp_loop.h"
+
+#include "kernels/fn_rec.h"
+#include "models/flash_next/prefill.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <map>
+#include <tuple>
+
+namespace ne::fn {
+namespace {
+MTLSize sz(int n) { return MTLSizeMake(n, 1, 1); }
+using clk = std::chrono::steady_clock;
+double ms_since(clk::time_point t) { return std::chrono::duration<double, std::milli>(clk::now() - t).count(); }
+uint32_t *u32(const Tensor &t) { return (uint32_t *)t.host(); }
+// verify forward F(R) ms: the adaptive policy's prior round costs. lab-draft, 18 Oct: re-measured on the T6 pack
+// (ne_fn_mtp_prof, sampled verify A + B at T 512: R 2..5; 1 row = the decode step; 6..8 extrapolated at +3 ms per row);
+// docs/mtp.md 11 (was section 6's projection 14.11 / 17.45 / 21.06 / 24.67 ...)
+const double kF[9] = {0, 13.1, 15.9, 19.5, 22.5, 25.3, 28.3, 31.3, 34.3};
+struct U4 { uint32_t x, y, z, w; };
+struct DraftSP { float temp, top_p; uint32_t top_k, seed, round, K, pad0, pad1; };  // = mtp.metal MtpDraftSP
+}  // namespace
+
+struct MtpLoop {
+  Model *m = nullptr;
+  int maxd = 4;
+  mtp::MtpW W;
+  mtp::MtpHead h1, h2, h8;  // 1-row seed / chain steps, 2-row seed (all drafts accepted), 8-row head prefill
+  Tensor vtok;              // u32 [16]: verify tokens [t1, d_1 .. d_D]
+  Tensor keep;              // u32 [4]: keep[0] = rows of the previous verify that the next step commits
+  Tensor hv[2], xv, lg, amv, cand, sl, kb, vb, ple_pend;
+  Tensor qb, dsp;  // sampled drafting: the proposals [16][32] (id, prob) per draft slot; DraftSP
+  Tensor xind;     // u32 [4]: indirect grid of mtp_logit_xform {ceil(vocab / 1024) or 0, rows, 1, 0} (lab-sampler)
+  std::vector<nax::LayerExtra> ex;  // per layer (GDN layers: lazy-commit pending rows)
+  HcW mixer;                        // the model's final mixer with the zero inject matrix
+  struct Verify {
+    Scratch s;
+    std::unique_ptr<Recorder> a, bg, bs;  // A; B with the greedy argmax / with the sampled top-K readout
+    uint32_t K = 0;                        // bs's K
+  };
+  std::map<int, Verify> ver;                                  // by rows
+  std::map<std::tuple<int, int, bool>, std::unique_ptr<Recorder>> dr;  // drafts by (seed rows, depth, sampled)
+  std::unique_ptr<Recorder> hp8, hp1;                         // head prefill (8 rows / 1 row, no readout)
+  // lab-headlazy: KV-only head steps (mtp::record_kv_step: the same KV rows as hp8 / hp1, without the attention
+  // core / MoE / mixer) over two host-filled staging buffers (double-buffered catch-up): kG groups of 8 rows or one
+  // group, and the 1-row tail. NE_MTP_HEAD_KV=full: hp8 / hp1 instead (A/B)
+  static constexpr int kG = 16;
+  std::unique_ptr<Recorder> hkG[2], hk8[2], hk1;
+  Tensor sh[2], stk[2];  // staging: hidden f32 [kG * 8][10240], tokens u32 [kG * 8]
+  bool kv_full = false;
+  // Lazy head (lab-headlazy): plain steps / feeds only queue their hidden rows; the head's KV catches up (head_drain)
+  // when pend_cap rows are pending, before an MTP run and before a snapshot. pend_cap <= 8 = the eager head
+  // (mtpcont: an 8-row head step as soon as 8 rows are known). NE_MTP_PEND_CAP, ne_fn_mtp_set_pend_cap.
+  int pend_cap = 1024;
+  HeadKvW hkw;  // lab-pfpath: the head's weights for prefill_head_kv (feed_body)
+  // The head's state between calls (docs/mtp.md 10.9): head KV rows [0, Lh) cached (row j = the pair (H_j, x_{j+1}),
+  // H = layer 47's pre-mixer hidden); target positions [Lh, T) pending: their hidden rows ph and the token after each
+  // (pt; -1 = not fed yet, only ever the last row). Valid while head_gen == m.gen (no plain step / prefill / restore
+  // since); at T = 0 it is trivially valid (empty).
+  int Lh = 0;
+  std::vector<float> ph;
+  std::vector<int> pt;
+  uint64_t head_gen = ~0ull;
+  double head_ms = 0;  // wall ms of head prefill work (drains) since the last mtp_generate started
+  // lab-draft: the copy rule (TensorFold's, as Splish's SPLASH_M5_COPY_MIN_MATCH): when the last copy_min tokens (incl.
+  // t1) occurred earlier in the context, the round drafts the tokens that followed that occurrence (one-hot q) instead
+  // of the head's. ctx = the tokens at positions [ctx0, T) as far as the loop knows them (its own feeds / steps /
+  // rounds; ne_fn_mtp_set_context after a state import); cidx = window hash -> continuation index in ctx (the most
+  // recent occurrence), every window ending at index < cidx_end indexed. NE_MTP_COPY_MIN_MATCH (0 = off),
+  // NE_MTP_COPY_DEPTH (drafts per copy round, <= max_depth).
+  std::vector<int> ctx;
+  int ctx0 = 0;
+  mtp::CopyIndex cidx;
+  int copy_min = 16, copy_maxd = 0;
+  FILE *trace = nullptr;  // NE_MTP_TRACE=path: one line per round (docs/mtp.md 11)
+  FILE *rdump = nullptr;  // lab-verify: NE_VERIFY_ROUTES=path: per round R, c, then route ids u16 [48][R][10]
+  Tensor rcap;            // u32 [48][8][20]: every layer's route of the last verify (rdump only)
+  // lab-draft: the gated verify (NE_MTP_QGATE=1, sampled drafts): verify the first k <= drafted drafts maximising
+  // E[tokens](k) - rate * vcost[k + 1], E from qacc = P(d_j accepted | d_<j accepted, q(d_j) in bin b) (10 bins of
+  // 0.1, EMAs over every round), rate = tokens per ms (EMAs), vcost[R] = ms of a round's verify + host at R rows.
+  bool qgate = false;
+  double qacc[10], qrc = 2.4, qrm = 22.0, vcost[9];
+};
+void MtpLoopDeleter::operator()(MtpLoop *p) const {
+  if (p && p->trace) fclose(p->trace);
+  if (p && p->rdump) fclose(p->rdump);
+  delete p;
+}
+// ---- copy rule (lab-draft)
+static void ctx_reset(MtpLoop &L, int T) {
+  L.ctx.clear();
+  L.ctx0 = T;
+  L.cidx.clear();
+}
+// tokens t[0, n) at positions [T, T + n) (a history that does not end at T is dropped first: unknown tokens between)
+static void ctx_add(MtpLoop &L, int T, const int *t, int n) {
+  if (L.copy_min <= 0) return;
+  if (L.ctx0 + (int)L.ctx.size() != T) ctx_reset(L, T);
+  L.ctx.insert(L.ctx.end(), t, t + n);
+}
+static int qbin(double qd) { return std::clamp((int)(qd * 10.0), 0, 9); }
+static int qgate_depth(MtpLoop &L, const int *drafts, const mtp::Dist *q, int Dd) {
+  const double rate = L.qrc / L.qrm;
+  int best = 1;
+  double run = 1.0, e = 1.0, bv = -1e30;
+  for (int k = 1; k <= Dd; k++) {
+    run *= L.qacc[qbin(q[k - 1].prob(drafts[k - 1]))];
+    e += run;
+    const double v = e - rate * L.vcost[k + 1];
+    if (v > bv) { bv = v; best = k; }
+  }
+  return best;
+}
+static void qgate_observe(MtpLoop &L, const int *drafts, const mtp::Dist *q, int D, int a, int R, double round_ms,
+                          int c) {
+  for (int j = 0; j < D && j <= a; j++) {
+    double &x = L.qacc[qbin(q[j].prob(drafts[j]))];
+    x = 0.97 * x + 0.03 * (j < a ? 1.0 : 0.0);
+  }
+  L.qrc = 0.95 * L.qrc + 0.05 * c;
+  L.qrm = 0.95 * L.qrm + 0.05 * round_ms;
+  if (R < 9) L.vcost[R] = 0.9 * L.vcost[R] + 0.1 * round_ms;  // (incl. the draft: the same for every k of a round)
+}
+static int copy_find(MtpLoop &L, int t1, int max, int *out) {
+  return mtp::copy_find(L.ctx, L.cidx, L.copy_min, t1, max, out);
+}
+static MtpLoop::Verify &get_verify(MtpLoop &L, int R, bool sampled, uint32_t K);
+static Recorder &get_draft(MtpLoop &L, int n, int D, bool sampled);
+
+MtpLoopPtr mtp_create(Model &m, int max_depth, int draft_bits, int shortlist) {
+  NE_CHECK(max_depth >= 1 && max_depth <= 7, "max_depth %d (1..7)", max_depth);
+  NE_CHECK(g_attn_qsa, "the MTP loop needs the QSA attention path (NE_FN_ATTN=qsa)");
+  MtpLoopPtr L(new MtpLoop);
+  L->m = &m;
+  L->maxd = max_depth;
+  L->W = mtp::load_mtp(*m.pack);
+  if (draft_bits) {
+    const std::vector<uint32_t> rows = mtp::draft_vocab_rows(L->W.vocab);  // lab-draft: NE_MTP_DRAFT_VOCAB
+    mtp::set_draft_head(L->W, draft_bits, shortlist, &rows);
+  }
+  if (const char *e = getenv("NE_MTP_COPY_MIN_MATCH")) L->copy_min = std::max(0, atoi(e));
+  L->copy_maxd = max_depth;
+  if (const char *e = getenv("NE_MTP_COPY_DEPTH")) L->copy_maxd = std::clamp(atoi(e), 1, max_depth);
+  if (const char *e = getenv("NE_MTP_TRACE")) L->trace = fopen(e, "a");
+  if (const char *e = getenv("NE_VERIFY_ROUTES")) {
+    L->rdump = fopen(e, "ab");
+    L->rcap = alloc(DType::U32, {48 * 8 * 20});
+  }
+  if (const char *e = getenv("NE_MTP_QGATE")) L->qgate = atoi(e) > 0;
+  for (int b = 0; b < 10; b++) L->qacc[b] = std::clamp(0.3 + 0.65 * (b + 0.5) / 10.0, 0.3, 0.95);
+  for (int R = 0; R < 9; R++) L->vcost[R] = 13.0 + 3.4 * std::max(0, R - 1) + 1.5;  // ms, measured 18 Oct (prof)
+  add_queue_residency(m, "language_model.mtp.");
+  L->h1 = mtp::alloc_head(L->W, 1, m.tmax);
+  // lab-mtpimg: head positions after image prompts. Head row j (the pair (H_j, x_{j+1})) sits at rope position j in
+  // the reference (mlx-vlm's drafter: 1-D ids = its cache length = text rope on all three MRoPE axes; "text", the
+  // default). "mrope" gives it the target's multimodal position of row j (the model's MRoPE table; identical for
+  // text prompts, whose table is empty).
+  if (const char *e = getenv("NE_MTP_HEAD_POS")) {
+    NE_CHECK(!*e || !strcmp(e, "text") || !strcmp(e, "mrope"), "NE_MTP_HEAD_POS=%s: text or mrope", e);
+    if (!strcmp(e, "mrope")) L->h1.st.qc.invf = m.mrope;
+  }
+  L->h2 = mtp::alloc_head(L->W, 2, 64);
+  L->h8 = mtp::alloc_head(L->W, 8, 64);
+  L->h2.st = L->h1.st;  // one head KV cache
+  L->h8.st = L->h1.st;
+  L->h2.amax = L->h1.amax;  // the chain's draft buffer: d_k at amax[k]
+  const int64_t RM = 8;
+  L->vtok = alloc(DType::U32, {16});
+  L->keep = alloc(DType::U32, {4});
+  L->hv[0] = alloc(DType::F32, {RM, HC, HID});
+  L->hv[1] = alloc(DType::F32, {RM, HC, HID});
+  L->xv = alloc(DType::F32, {RM, HID});
+  L->lg = alloc(DType::F32, {RM, VOCAB});
+  L->amv = alloc(DType::U32, {16});
+  L->cand = alloc(DType::F32, {RM, 128, 32, 2});
+  L->sl = alloc(DType::F32, {RM, 32, 2});
+  L->kb = alloc(DType::F32, {RM, HCD});
+  L->vb = alloc(DType::F32, {RM, HID});
+  L->ple_pend = alloc(DType::F32, {RM, HCD});
+  L->qb = alloc(DType::F32, {16, 32, 2});
+  L->dsp = alloc(DType::U32, {8});
+  L->xind = alloc(DType::U32, {4});
+  for (auto &w : m.L) L->ex.push_back(w.linear ? nax::alloc_layer_extra(0, true, &L->keep) : nax::alloc_layer_extra());
+  L->mixer = m.mixer;
+  L->mixer.inject = m.dummy_inj;
+  L->hp8 = std::make_unique<Recorder>();
+  L->hp8->begin();
+  mtp::record_prefill_chunk(*L->hp8, L->W, L->h8, false);
+  L->hp8->end();
+  L->hp1 = std::make_unique<Recorder>();
+  L->hp1->begin();
+  mtp::record_step(*L->hp1, L->W, L->h1, nullptr, nullptr, nullptr, 0, false);
+  L->hp1->end();
+  if (const char *e = getenv("NE_MTP_HEAD_KV")) L->kv_full = std::string(e) == "full";
+  if (const char *e = getenv("NE_MTP_PEND_CAP")) L->pend_cap = std::max(0, atoi(e));
+  for (int b = 0; b < 2; b++) {
+    L->sh[b] = alloc(DType::F32, {MtpLoop::kG * 8, HCD});
+    L->stk[b] = alloc(DType::U32, {MtpLoop::kG * 8});
+    for (int G : {MtpLoop::kG, 1}) {
+      auto &p = G == 1 ? L->hk8[b] : L->hkG[b];
+      p = std::make_unique<Recorder>();
+      p->begin();
+      for (int g = 0; g < G; g++)
+        mtp::record_kv_step(*p, L->W, L->h8, L->stk[b].view(4 * 8 * (size_t)g, DType::U32, {8}), L->sh[b].rows(8 * g, 8));
+      p->end();
+    }
+  }
+  L->hk1 = std::make_unique<Recorder>();
+  L->hk1->begin();
+  mtp::record_kv_step(*L->hk1, L->W, L->h1, L->h1.tok, L->h1.hid);
+  L->hk1->end();
+  L->ph.reserve((size_t)(std::max(L->pend_cap, 8) + 16) * HCD);
+  L->hkw = HeadKvW{&L->W.fc_e, &L->W.fc_h, &L->W.embed, L->W.norm_e, L->W.norm_h, &L->W.layer, (uint32_t)L->W.vocab};
+  // record every verify (greedy + sampled K = 20) and draft variant now, and replay each once: pipelines compiled,
+  // residency made, first-replay costs paid here, not in the first rounds (the states are reset by mtp_generate)
+  for (int R = 2; R <= max_depth + 1; R++) {
+    MtpLoop::Verify &v = get_verify(*L, R, false, 0);
+    get_verify(*L, R, true, 20);
+    v.a->run();
+    v.bg->run();
+    v.bs->run();
+  }
+  for (int n = 1; n <= 2; n++)
+    for (int D = 1; D <= max_depth; D++)
+      for (int sd = 0; sd < 2; sd++)
+        if (!sd || draft_bits) get_draft(*L, n, D, sd).run();
+  reset(m);
+  return L;
+}
+
+// lab-verify: NE_VERIFY_ROUTES debug capture of layer l's routing (s.route [R][20] is rewritten by the next layer's router)
+static void route_cap(MtpLoop &L, Recorder &r, Scratch &s, int l) {
+  if (!L.rdump) return;
+  const uint32_t n = (uint32_t)s.rows * 20u, off = (uint32_t)l * 8u * 20u;
+  r.dispatch(pso("mtp_copy_u32", 32), {s.route, L.rcap, Arg::value(U4{0, off, n, 0})}, sz(1), sz(256));
+  r.barrier();
+}
+
+static MtpLoop::Verify &get_verify(MtpLoop &L, int R, bool sampled, uint32_t K) {
+  Model &m = *L.m;
+  MtpLoop::Verify &v = L.ver[R];
+  if (v.a && (sampled ? (v.bs && v.K == K) : (bool)v.bg)) return v;
+  if (!v.a) {
+    v.s = alloc_scratch(R);  // not nax::alloc_scratch_rows: its R = 3, 5..8 path keeps the PLE buffers at 4 rows
+    v.a = std::make_unique<Recorder>();
+    Recorder &r = *v.a;
+    r.begin();
+    r.dispatch(pso("fn_embed_g" + std::to_string(m.embed.group)), {L.vtok, m.embed.w, m.embed.s, m.embed.b, L.hv[0]},
+               sz(R), sz(256));
+    r.barrier();
+    nax::record_layer(r, m.L[0], m.st[0], v.s, L.ex[0], L.hv[0], L.hv[1], true);
+    route_cap(L, r, v.s, 0);
+    r.end();
+  }
+  auto &bp = sampled ? v.bs : v.bg;
+  if (sampled) v.K = K;
+  bp = std::make_unique<Recorder>();
+  Recorder &r = *bp;
+  Scratch &s = v.s;
+  const std::string rs = "_r" + std::to_string(R);
+  r.begin();
+  const PleW &e = m.L[1].ple;
+  nax::record_ple_proj(r, R, s, e, s.ple_emb, L.kb, L.vb);  // q8: NAX GEMM; T6: K8 t6 Linears (mtp-loop-check (2))
+  r.barrier();
+  r.dispatch(pso("mtp_ple_mix_lazy" + rs, 1024),
+             {L.hv[1], L.kb, L.vb, e.nk, e.nq, e.nc, e.conv, m.st[1].ple_conv, s.hp, L.ple_pend, L.keep}, sz(HC),
+             sz(1024));
+  r.barrier();
+  nax::record_layer(r, m.L[1], m.st[1], s, L.ex[1], s.hp, L.hv[0], true);
+  route_cap(L, r, s, 1);
+  for (size_t l = 2; l < m.L.size(); l++) {
+    nax::record_layer(r, m.L[l], m.st[l], s, L.ex[l], L.hv[l % 2], L.hv[(l + 1) % 2], true);
+    route_cap(L, r, s, (int)l);
+  }
+  const Tensor &hf = L.hv[m.L.size() % 2];
+  const HcW &x = L.mixer;
+  if (x.down.t6) {  // lab-t6wire: bf16 mixer (T6 pack)
+    t6_hc_read(r, x, R, hf, false, s, s.mix_a, s.inj_a, L.xv);
+  } else if (hc_v2(R)) {  // HC read v2 (kernels/fn_rec.h)
+    krec::hc_pre3(r, x, R, hf, x.inject, s.inj_a, s.hc_part);
+    krec::hc_mix(r, x, R, hf, s.mix_a, s.inj_a, L.xv, s.hc_part);
+  } else {
+    nax::record_hc_pre(r, R, L.mixer, hf, s.mix_a, s.inj_a, s, L.ex[0]);
+    r.dispatch(pso("fn_hc_mix_g" + std::to_string(x.up.group) + rs),
+               {hf, x.norm, x.up.w, x.up.s, x.up.b, s.mix_a, s.inj_a, L.xv}, sz(HID / 8), sz(256));
+    r.barrier();
+  }
+  nax::record_q8(r, R, L.xv, {&m.head}, {L.lg});
+  r.barrier();
+  // the sampler's logit_bias / penalties on the rows (0 threadgroups unless the request set them; lab-sampler)
+  r.dispatch_indirect(pso("mtp_logit_xform", 1024), {L.lg, L.vtok, m.sp, m.bias, m.cnt}, L.xind.buf, L.xind.offset, sz(1024));
+  r.barrier();
+  const uint32_t V = VOCAB;
+  if (!sampled) {
+    r.dispatch(pso("mtp_argmax", 1024), {L.lg, L.amv, Arg::value(V), Arg::value(0u)}, sz(R), sz(1024));
+  } else {
+    r.dispatch(pso("mtp_topk_local"), {L.lg, L.cand, Arg::value(V), Arg::value(K)}, MTLSizeMake(128, R, 1), sz(256));
+    r.barrier();
+    r.dispatch(pso("mtp_topk_merge", 1024), {L.cand, L.sl, L.amv, Arg::value(K)}, sz(R), sz(1024));
+  }
+  r.barrier();
+  r.end();
+  return v;
+}
+
+static Recorder &get_draft(MtpLoop &L, int n, int D, bool sampled) {
+  auto &p = L.dr[{n, D, sampled}];
+  if (p) return *p;
+  p = std::make_unique<Recorder>();
+  Recorder &r = *p;
+  r.begin();
+  mtp::MtpHead &hs = n == 1 ? L.h1 : L.h2;
+  // sampled drafting: replace each step's argmax by a draw from its shortlist (and keep the proposal for the accept)
+  auto sample = [&](const mtp::MtpHead &h, uint32_t at) {
+    if (!sampled) return;
+    r.dispatch(pso("mtp_draft_sample", 32), {h.sl, L.h1.amax, L.qb, L.dsp, Arg::value(at)}, sz(h.rows), sz(32));
+    r.barrier();
+  };
+  mtp::record_step(r, L.W, hs, nullptr, nullptr, nullptr, n == 1 ? 1u : 0u);  // d_1 -> amax[1]
+  sample(hs, n == 1 ? 1u : 0u);
+  Tensor prev = hs.h_out.rows(n - 1, 1);
+  for (int k = 2; k <= D; k++) {
+    const Tensor tk = L.h1.amax.view(4 * (size_t)(k - 1), DType::U32, {1});
+    const Tensor out = prev.buf == L.h1.h_out.buf ? L.h1.h_out2 : L.h1.h_out;
+    mtp::record_step(r, L.W, L.h1, &tk, &prev, &out, (uint32_t)k);
+    sample(L.h1, (uint32_t)k);
+    prev = out;
+  }
+  r.dispatch(pso("mtp_copy_u32", 32), {L.h1.amax, L.vtok, Arg::value(U4{1, 1, (uint32_t)D, 0})}, sz(1), sz(32));
+  r.barrier();
+  r.end();
+  return r;
+}
+
+// ---- head state kept in step with the model (MTP from the current state; docs/mtp.md 10.9)
+bool mtp_head_ok(MtpLoop &L) {
+  Model &m = *L.m;
+  if (m.dirty) return false;
+  if (m.T == 0) {  // empty model (reset): empty head
+    L.Lh = 0;
+    L.ph.clear();
+    L.pt.clear();
+    L.head_gen = m.gen;
+    if (L.ctx0 != 0 || !L.ctx.empty()) ctx_reset(L, 0);
+  }
+  return L.head_gen == m.gen;
+}
+// the head is out of step with the model (a stale snapshot / state imported): drop its bookkeeping too, so no old
+// pending rows survive into a later export
+static void head_invalidate(MtpLoop &L) {
+  L.Lh = 0;
+  L.ph.clear();
+  L.pt.clear();
+  L.head_gen = ~0ull;
+  ctx_reset(L, L.m->T);
+}
+// a new pending row (hidden of the target position just stepped, the token after it if known)
+static void head_pend(MtpLoop &L, const float *H, int next) {
+  NE_CHECK(L.pt.empty() || L.pt.back() >= 0, "head: pending row without its token");
+  L.ph.insert(L.ph.end(), H, H + HCD);
+  L.pt.push_back(next);
+}
+// the token after the last pending row (= the next token the target is fed)
+static void head_next(MtpLoop &L, int tok) {
+  if (!L.pt.empty() && L.pt.back() < 0) L.pt.back() = tok;
+}
+// run the head (KV only) over the pending rows whose token is known, leaving `tail` rows pending in any case: whole
+// 8-row steps (rows [Lh, Lh + 8)), then with `all` the rest one row at a time (the fresh prefill's order, so a
+// prefix fed in pieces gives the head the same 8-row steps as one prompt)
+static void head_drain(MtpLoop &L, bool all, int tail) {
+  int avail = (int)L.pt.size() - tail;
+  while (avail > 0 && L.pt[avail - 1] < 0) avail--;
+  if (avail < (all ? 1 : 8)) return;
+  auto t0 = clk::now();
+  u32(L.h1.st.pos)[0] = (uint32_t)L.Lh;
+  int i = 0;
+  if (L.kv_full) {
+    for (; i + 8 <= avail; i += 8) {
+      memcpy(L.h8.hid.host(), L.ph.data() + (size_t)i * HCD, (size_t)8 * HCD * 4);
+      for (int r = 0; r < 8; r++) u32(L.h8.tok)[r] = (uint32_t)L.pt[i + r];
+      L.hp8->run();
+    }
+  } else {  // KV-only 8-row steps, kG groups per command buffer; the next staging buffer fills while one runs
+    Recorder *busy = nullptr;
+    for (int b = 0; avail - i >= 8; b ^= 1) {
+      const int n = avail - i >= MtpLoop::kG * 8 ? MtpLoop::kG * 8 : 8;
+      memcpy(L.sh[b].host(), L.ph.data() + (size_t)i * HCD, (size_t)n * HCD * 4);
+      for (int r = 0; r < n; r++) u32(L.stk[b])[r] = (uint32_t)L.pt[i + r];
+      Recorder &rc = n == 8 ? *L.hk8[b] : *L.hkG[b];
+      rc.commit();
+      if (busy) busy->wait();
+      busy = &rc;
+      i += n;
+    }
+    if (busy) busy->wait();
+  }
+  if (all)
+    for (; i < avail; i++) {
+      memcpy(L.h1.hid.host(), L.ph.data() + (size_t)i * HCD, (size_t)HCD * 4);
+      u32(L.h1.tok)[0] = (uint32_t)L.pt[i];
+      (L.kv_full ? L.hp1 : L.hk1)->run();
+    }
+  L.Lh += i;
+  NE_CHECK((int)u32(L.h1.st.pos)[0] == L.Lh, "head: KV length %u, expected %d", u32(L.h1.st.pos)[0], L.Lh);
+  L.ph.erase(L.ph.begin(), L.ph.begin() + (size_t)i * HCD);
+  L.pt.erase(L.pt.begin(), L.pt.begin() + i);
+  L.head_ms += ms_since(t0);
+  static const bool flog = getenv("NE_FEED_LOG") != nullptr;
+  if (flog) fprintf(stderr, "head_drain: %d rows to Lh %d: %.1f ms\n", i, L.Lh, ms_since(t0));
+}
+// plain steps / feeds: drain only once pend_cap rows are pending (the lazy head; pend_cap <= 8: eager)
+static void head_lazy(MtpLoop &L) {
+  if ((int)L.pt.size() >= std::max(L.pend_cap, 8)) head_drain(L, false, 0);
+}
+// the target over toks[0, n) at m.T (no sample: chunked when `chunk_policy`, else 4-row + 1-row body steps, as
+// prefill()), layer 47's hidden of every position into the head's pending rows
+static void feed_body(MtpLoop &L, const int *toks, int n, bool chunk_policy, const int *ahead = nullptr,
+                      int n_ahead = 0) {
+  Model &m = *L.m;
+  if (n <= 0) return;
+  head_next(L, toks[0]);
+  ctx_add(L, m.T, toks, n);
+  auto nxt = [&](int j) { return j + 1 < n ? toks[j + 1] : -1; };
+  const Tensor &hlast = m.h[m.L.size() % 2], &hlast4 = m.h4[m.L.size() % 2];
+  int i = 0;
+  static const bool flog = getenv("NE_FEED_LOG") != nullptr;  // lab-pfpath: per-chunk wall split (no behaviour change)
+  if (chunk_policy) {
+    Prefill &pf = chunked(m);
+    const Tensor &hc = prefill_hidden(pf, (int)m.L.size());
+    // lab-pfpath: the head's KV rows of each chunk as one batched pass (prefill_head_kv) instead of queueing the
+    // chunk's rows for 8-row KV-only steps; NE_MTP_HEAD_CHUNK=0: the queue (read per feed: in-process A/B)
+    const char *hce = getenv("NE_MTP_HEAD_CHUNK");
+    const bool hchunk = !(hce && std::string(hce) == "0") && prefill_head_kv_ok(pf, L.h1.st);
+    for (; i < n; i += kChunk) {
+      const int cn = std::min(kChunk, n - i);
+      const auto f0 = clk::now();
+      // the next chunk's n-gram rows are gathered while this one runs (within the call: prefill_tokens' own
+      // overlap; the call's last chunk: the caller's `ahead`, the next call's first tokens)
+      const bool last = i + cn >= n;
+      prefill_tokens(pf, toks + i, cn, last ? ahead : toks + i + cn, last ? n_ahead : n - i - cn);
+      const auto f1 = clk::now();
+      int r0 = 0;
+      if (hchunk) {
+        // rows queued before this chunk first (every one's next token is known now), so the chunk's rows follow
+        // them in the head's cache; then rows [T0, T0 + known) in one pass (the call's last row waits for its token)
+        head_drain(L, true, 0);
+        const int T0 = m.T - cn;
+        if (L.pt.empty() && L.Lh == T0) {
+          const int known = last ? cn - 1 : cn;
+          if (known > 0) {
+            const auto h0 = clk::now();
+            prefill_head_kv(pf, L.hkw, L.h1.st, toks + i + 1, known, T0);
+            L.Lh += known;
+            u32(L.h1.st.pos)[0] = (uint32_t)L.Lh;
+            L.head_ms += ms_since(h0);
+          }
+          r0 = known;
+        }
+      }
+      for (int r = r0; r < cn; r++) head_pend(L, (const float *)hc.host() + (size_t)r * HCD, nxt(i + r));
+      const auto f2 = clk::now();
+      head_lazy(L);
+      if (flog) {
+        const PfStats &s = prefill_stats(pf);
+        fprintf(stderr, "feed: chunk %d at T %d: prefill %.1f ms (GPU %.1f, gather %.1f, rec %.1f), head %d rows batched "
+                "+ %d queued %.1f, head_drain %.1f\n", cn, m.T - cn,
+                std::chrono::duration<double, std::milli>(f1 - f0).count(), s.gpu_ms, s.gather_ms, s.rec_ms, r0, cn - r0,
+                std::chrono::duration<double, std::milli>(f2 - f1).count(), ms_since(f2));
+      }
+    }
+  }
+  const auto fs = clk::now();
+  const int i0 = i;
+  if (m.rec_a4)
+    for (; i + 4 <= n; i += 4) {
+      step4(m, toks + i);
+      for (int r = 0; r < 4; r++) head_pend(L, (const float *)hlast4.host() + (size_t)r * HCD, nxt(i + r));
+      head_lazy(L);
+    }
+  for (; i < n; i++) {
+    step(m, toks[i], false);
+    head_pend(L, (const float *)hlast.host(), nxt(i));
+    head_lazy(L);
+  }
+  if (flog && i > i0) fprintf(stderr, "feed: %d step rows at T %d: %.1f ms\n", i - i0, m.T - (i - i0), ms_since(fs));
+}
+
+void mtp_feed(MtpLoop &L, const int *toks, int n, const int *ahead, int n_ahead) {
+  NE_CHECK(n >= 1, "mtp_feed: no tokens");
+  check_feed(*L.m, toks, n, n, "mtp_feed");
+  const int htmax = L.h1.st.qc.tmax;  // the head's KV rows [0, Lh) with Lh <= T: its cache must hold T + n too
+  NE_CHECK(htmax == 0 || L.m->T + n <= htmax, "mtp_feed: the MTP head's context is full (%d + %d > %d)", L.m->T, n, htmax);
+  NE_CHECK(mtp_head_ok(L), "mtp_feed: the MTP head is not in step with the model (plain step / prefill / restore "
+                           "since its last MTP call): reset or restore an MTP snapshot");
+  feed_body(L, toks, n, use_chunked(*L.m, n), ahead, n_ahead);
+  L.head_gen = L.m->gen;
+}
+
+StepOut mtp_step(MtpLoop &L, int tok, bool head) {
+  Model &m = *L.m;
+  NE_CHECK(mtp_head_ok(L), "mtp_step: the MTP head is not in step with the model");
+  head_next(L, tok);
+  ctx_add(L, m.T, &tok, 1);
+  StepOut o = step(m, tok, head);
+  head_pend(L, (const float *)m.h[m.L.size() % 2].host(), -1);
+  head_lazy(L);
+  L.head_gen = m.gen;
+  return o;
+}
+
+double mtp_catch_up(MtpLoop &L) {
+  NE_CHECK(mtp_head_ok(L), "mtp_catch_up: the MTP head is not in step with the model");
+  const double h0 = L.head_ms;
+  head_drain(L, false, 0);
+  return L.head_ms - h0;
+}
+void mtp_set_pend_cap(MtpLoop &L, int cap) {
+  L.pend_cap = std::max(0, cap);
+  if (mtp_head_ok(L)) head_lazy(L);
+}
+
+static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int max_new, int stop, int depth,
+                         uint64_t seed, int *out, MtpStats *st, MtpTokenCb cb, void *cb_ctx);
+int mtp_generate(MtpLoop &L, const int *prompt, int n, int max_new, int stop, int depth, uint64_t seed, int *out,
+                 MtpStats *st, MtpTokenCb cb, void *cb_ctx) {
+  return generate_impl(L, true, prompt, n, max_new, stop, depth, seed, out, st, cb, cb_ctx);
+}
+int mtp_generate_from(MtpLoop &L, const int *toks, int n, int max_new, int stop, int depth, uint64_t seed, int *out,
+                      MtpStats *st, MtpTokenCb cb, void *cb_ctx) {
+  return generate_impl(L, false, toks, n, max_new, stop, depth, seed, out, st, cb, cb_ctx);
+}
+
+static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int max_new, int stop, int depth,
+                         uint64_t seed, int *out, MtpStats *st, MtpTokenCb cb, void *cb_ctx) {
+  Model &m = *L.m;
+  NE_CHECK(n >= 1 && max_new >= 1, "bad arguments");
+  NE_CHECK(!m.P.mask_on, "ne_fn_model_set_mask(NULL) first: the MTP loop does not apply the sampler's token mask");
+  NE_CHECK(!m.P.lp_on, "the MTP loop gives no logprobs (lab-sampler): ne_fn_model_set_sampler_ex(.., logprob_k = 0) or use "
+                       "the step path");
+  const bool xform = m.P.bias_on || m.P.pen_on;   // logit_bias / penalties: applied to the verify rows (mtp_logit_xform)
+  NE_CHECK(depth >= 0 && depth <= L.maxd, "depth %d (0 = adaptive, 1..%d)", depth, L.maxd);
+  const bool greedy = m.P.temp < 0.01f || m.P.top_k <= 1;
+  const uint32_t K = greedy ? 0 : m.P.top_k;
+  NE_CHECK(greedy || K <= 32, "sampled MTP needs top_k 1..32 (got %u)", K);
+  const mtp::SampleParams sp{m.P.temp, (int)m.P.top_k, m.P.top_p, m.P.min_p};
+  // sampled mode: drafts drawn from the head's shortlist (default; exact accept with q = that proposal) or argmax
+  // drafts (point masses: accept with p(d)); NE_MTP_DRAFT=argmax|sample
+  const char *de = getenv("NE_MTP_DRAFT");
+  const bool sdraft = !greedy && L.W.draft_bits && !(de && std::string(de) == "argmax");
+  {
+    DraftSP d{m.P.temp, m.P.top_p, m.P.top_k, (uint32_t)(seed * 2654435761u + 12345u), 0, (uint32_t)L.W.shortlist, 0, 0};
+    memcpy(L.dsp.host(), &d, sizeof(d));
+  }
+  // context and tokens before any state is touched (a fresh run resets: T = 0 then)
+  {
+    const int T0 = fresh ? 0 : m.T, htmax = L.h1.st.qc.tmax;
+    NE_CHECK(T0 + n + 1 <= m.tmax && (htmax == 0 || T0 + n + 1 <= htmax), "context full (%d + %d of %d)", T0, n, m.tmax);
+    NE_CHECK(fresh || !m.dirty, "model state is one token ahead after generate(): reset() first");
+    for (int i = 0; i < n; i++) NE_CHECK(prompt[i] >= 0 && prompt[i] < VOCAB, "token %d out of range", prompt[i]);
+  }
+  MtpStats S;
+  const int M1 = L.maxd + 1;
+  S.hist.assign((size_t)M1 * M1, 0);
+  if (fresh) reset(m);
+  NE_CHECK(mtp_head_ok(L), "mtp_generate_from: the MTP head is not in step with the model (plain step / prefill / "
+                           "restore since its last MTP call): reset or restore an MTP snapshot");
+  NE_CHECK(m.T + n + 1 <= m.tmax, "context full (%d + %d of %d)", m.T, n, m.tmax);
+  u32(L.keep)[0] = 0;
+  L.head_ms = 0;
+
+  // ---- prefill: the target over prompt[0, n - 1) (chunked prefill from 16 tokens, else 4-row chunks + 1-row steps);
+  // layer 47's pre-mixer hidden of every position feeds the head over the (H_j, x_{j+1}) pairs in 8-row steps as they
+  // come (KV only). From the current state (fresh = false) the head's pending rows [Lh, T) go first.
+  auto t0 = clk::now();
+  const Tensor &hlast = m.h[m.L.size() % 2];
+  feed_body(L, prompt, n - 1, use_chunked(m, n));
+  head_next(L, prompt[n - 1]);
+  ctx_add(L, m.T, prompt + n - 1, 1);
+  StepOut o = step(m, prompt[n - 1], true);
+  gdn_materialise(m.st);  // lab-gdnlazy: the verify's lazy-commit kernels read ssm (the last prompt step deferred)
+  head_pend(L, (const float *)hlast.host(), o.token);
+  // lab-ttft: stream the first token before the head's catch-up (the drafts of round 0 need it, the token does not)
+  out[0] = o.token;
+  const bool cb_stop = cb && cb(cb_ctx, out, 1);
+  head_drain(L, true, 1);  // every pair but the seed (H_{T-1}, t1) into the head's KV
+  S.prefill_ms = ms_since(t0);
+  S.head_prefill_ms = L.head_ms;
+  // round 0's seed: (H_{T-1}, t1)
+  int T = m.T, t1 = o.token, seed_n = 1, Lh = L.Lh;
+  NE_CHECK(Lh == T - 1 && L.pt.size() == 1, "head prefill: KV length %d, T %d, pending %zu", Lh, T, L.pt.size());
+  u32(L.h1.tok)[0] = (uint32_t)t1;
+  memcpy(L.h1.hid.host(), L.ph.data(), (size_t)HCD * 4);
+  L.ph.clear();
+  L.pt.clear();
+  m.dirty = true;  // pending lazy GDN / PLE rows from here until the end-of-run flush
+  int k = 0;
+  out[k++] = t1;
+  bool done = t1 == stop || k >= max_new;
+  if (cb_stop) done = true;  // streaming / abort (lab-server): t1 went out above
+
+  std::vector<double> cost(M1);
+  // draft step ms (ne_fn_mtp_prof 18 Oct: 4-bit readout 1.12 full vocabulary / 0.74 pruned; the 8-bit head 1.55)
+  const double tdraft = !L.W.draft_bits ? 1.55 : L.W.draft_ids.buf ? 0.74 : 1.12;
+  for (int d = 0; d < M1; d++) cost[d] = kF[d + 1] + d * tdraft + 0.15;
+  mtp::DepthPolicy pol(cost, 0.75);
+  pol.min_depth = 1;
+  pol.max_depth = L.maxd;
+  mtp::Rng rng(seed);
+  if (L.trace) fprintf(L.trace, "run fresh %d n %d T %d depth %d greedy %d sdraft %d copy_min %d vocab %d\n", fresh ? 1 : 0, n,
+                       T, depth, greedy ? 1 : 0, sdraft ? 1 : 0, L.copy_min, L.W.draft_head.rows);
+  auto td = clk::now();
+  auto th = clk::now();  // end of the previous round's B wait (host time = accept + bookkeeping)
+  // lab-draft: copy rounds leave the head's pairs pending in L.ph / L.pt (seed_n = 0): a head round drains them first
+  int copy_buf[16];
+  double drain_ms = 0;
+  while (!done) {
+    int D = depth ? depth : pol.next_depth();
+    // copy rule: a verbatim continuation of an earlier occurrence of the last copy_min tokens (one-hot drafts)
+    int nc = L.copy_min > 0 ? copy_find(L, t1, L.copy_maxd, copy_buf) : 0;
+    const bool copy = nc > 0;
+    if (copy) D = nc;
+    // headroom: a round keeps up to D + 1 rows and the end-of-run flush needs 2 more (its dummy rows at T, T + 1),
+    // so T + D + 1 + 2 <= tmax -- a run near the context end stops <= 2 tokens early instead of leaving a dirty state
+    D = std::min(D, m.tmax - T - 3);
+    if (D < 1) break;
+    drain_ms = 0;
+    if (!copy && seed_n == 0) {  // after copy rounds: the head's KV over every pending pair but the last (the seed)
+      auto t0d = clk::now();
+      L.Lh = Lh;
+      head_drain(L, true, 1);
+      Lh = L.Lh;
+      NE_CHECK(L.pt.size() == 1 && L.ph.size() == (size_t)HCD, "copy rule: %zu head rows pending after the drain", L.pt.size());
+      u32(L.h1.tok)[0] = (uint32_t)L.pt[0];
+      memcpy(L.h1.hid.host(), L.ph.data(), (size_t)HCD * 4);
+      L.ph.clear();
+      L.pt.clear();
+      seed_n = 1;
+      drain_ms = ms_since(t0d);
+    }
+    // lab-draft: the gated verify (NE_MTP_QGATE): draft Dd = D deep, then verify only the first D' <= Dd drafts whose
+    // expected gain pays for their verify rows (by the drafts' own proposal probabilities, docs/mtp.md 11). Only with
+    // sampled drafts (q known); A is then committed after the drafts are read instead of right behind the draft.
+    const bool gate = L.qgate && sdraft && !copy && depth > 0;  // (adaptive depth: the DepthPolicy decides)
+    const int Dd = copy ? 0 : D;  // drafted depth (the head's chain rows)
+    Recorder *drp = copy ? nullptr : &get_draft(L, seed_n, Dd, sdraft);
+    ((DraftSP *)L.dsp.host())->round = (uint32_t)S.rounds;
+    u32(L.h1.st.pos)[0] = (uint32_t)Lh;
+    u32(L.vtok)[0] = (uint32_t)t1;
+    u32(m.pos)[0] = (uint32_t)T;
+    const double host_pre = std::chrono::duration<double, std::micro>(clk::now() - th).count();
+    S.host_us += host_pre;
+    auto tr = clk::now();
+    MtpLoop::Verify *vp = nullptr;
+    auto arm = [&](int Dv) {  // the verify for Dv drafts: its recordings and indirect grid
+      vp = &get_verify(L, Dv + 1, !greedy, K);
+      u32(L.xind)[0] = xform ? (uint32_t)((VOCAB + 1023) / 1024) : 0u;
+      u32(L.xind)[1] = (uint32_t)(Dv + 1);
+      u32(L.xind)[2] = 1u;
+    };
+    if (copy)
+      for (int j = 0; j < D; j++) u32(L.vtok)[j + 1] = (uint32_t)copy_buf[j];
+    else
+      drp->commit();
+    if (!gate) {
+      arm(D);
+      vp->a->commit();
+    }
+    if (drp) drp->wait();
+    const double t_dw = ms_since(tr);
+    // the proposals of sampled drafts (what each d_j was drawn from: the accept's q)
+    mtp::Dist q[8];
+    int drafts[8];
+    for (int j = 0; j < Dd; j++) drafts[j] = (int)u32(L.vtok)[j + 1];
+    if (sdraft && !copy)
+      for (int j = 0; j < Dd; j++) {
+        const float *qr = (const float *)L.qb.host() + (size_t)(j + 1) * 64;
+        for (int c = 0; c < 32; c++) {
+          uint32_t id;
+          memcpy(&id, &qr[2 * c], 4);
+          if (id == 0xFFFFFFFFu) break;
+          q[j].ids.push_back((int)id);
+          q[j].p.push_back(qr[2 * c + 1]);
+        }
+      }
+    if (gate) {
+      D = qgate_depth(L, drafts, q, Dd);
+      arm(D);
+      vp->a->commit();
+    }
+    MtpLoop::Verify &v = *vp;
+    const int R = D + 1;
+    int toks[8];
+    toks[0] = t1;
+    for (int j = 0; j < D; j++) toks[j + 1] = drafts[j] = (int)u32(L.vtok)[j + 1];
+    auto tg = clk::now();
+    gather_ple_rows(m, m.hist[0], m.hist[1], toks, R, (float *)v.s.ple_emb.host());
+    const double gus = std::chrono::duration<double, std::micro>(clk::now() - tg).count();
+    S.gather_us += gus;
+    Recorder &vb = greedy ? *v.bg : *v.bs;
+    vb.commit();
+    const double t_bc = ms_since(tr);
+    v.a->wait();
+    vb.wait();
+    th = clk::now();
+    const double dgpu = drp ? drp->gpu_ms() : 0.0;
+    S.draft_gpu_ms += dgpu;
+    S.verify_gpu_ms += v.a->gpu_ms() + vb.gpu_ms();
+    mtp::VerifyResult res;
+    float qtr[16];
+    const float *trace_q = nullptr;
+    if (greedy) {
+      int am[8];
+      for (int j = 0; j < R; j++) am[j] = (int)u32(L.amv)[j];
+      res = mtp::accept_greedy(drafts, D, am);
+    } else {
+      mtp::Dist p[8];
+      for (int j = 0; j < R; j++) p[j] = mtp::shortlist_dist((const float *)L.sl.host() + (size_t)j * K * 2, K, sp);
+      // copy drafts (and argmax drafts) are point masses: q = nullptr
+      res = mtp::accept_sampled_p(drafts, D, p, sdraft && !copy ? q : nullptr, rng);
+      if (L.trace && sdraft && !copy) {
+        for (int j = 0; j < D; j++) {
+          qtr[2 * j] = q[j].prob(drafts[j]);
+          qtr[2 * j + 1] = q[j].p.empty() ? 0.0f : q[j].p[0];
+        }
+        trace_q = qtr;
+      }
+      static const bool dbg = getenv("NE_MTP_DEBUG") != nullptr;
+      if (dbg && S.rounds < 2) {
+        fprintf(stderr, "round %d seed %llu: accepted %d next %d\n", S.rounds, (unsigned long long)seed, res.accepted,
+                res.next_token);
+        for (int j = 0; j < D; j++) {
+          fprintf(stderr, "  d%d = %d  q:", j + 1, drafts[j]);
+          for (size_t c = 0; c < q[j].ids.size(); c++) fprintf(stderr, " %d:%.3f", q[j].ids[c], q[j].p[c]);
+          fprintf(stderr, "  | p:");
+          for (size_t c = 0; c < std::min<size_t>(p[j].ids.size(), 6); c++) fprintf(stderr, " %d:%.3f", p[j].ids[c], p[j].p[c]);
+          fprintf(stderr, "\n");
+        }
+      }
+    }
+    const int a = res.accepted;
+    const int k0 = k;
+    for (int tkn : res.emitted) {
+      if (k >= max_new) { done = true; break; }
+      out[k++] = tkn;
+      if (m.P.pen_on) u32(m.cnt)[tkn] += 1u;   // the generated-token counts of the penalties (the step path counts in pass 2)
+      if (tkn == stop) { done = true; break; }
+    }
+    if (k >= max_new) done = true;
+    if (cb && k > k0 && cb(cb_ctx, out + k0, k - k0)) done = true;
+    S.rounds++;
+    S.hist[(size_t)D * M1 + a]++;
+    // commit: c rows of this verify (t1, d_1 .. d_{c-1}) enter every cache, c = a + 1 unless the emission was cut
+    // (stop token / max_new inside the round): then only t1 and the emitted tokens before the last one, so the state
+    // is always prompt + out[0, k - 1) and the run can be continued from it
+    const int c = k - k0;
+    NE_CHECK(c >= 1, "round emitted nothing");
+    for (int j = 0; j < c; j++) {
+      m.hist[0] = m.hist[1];
+      m.hist[1] = toks[j];
+    }
+    ctx_add(L, T, toks, c);
+    T += c;
+    m.T = T;
+    u32(L.keep)[0] = (uint32_t)c;
+    const float *hvr = (const float *)L.hv[m.L.size() % 2].host();
+    if (copy) {
+      // copy round: the head did not run. Its pending pairs = the old seed rows (if any) + every committed verify row
+      // (target hidden, the token after it); a head round drains them (KV only) before its seed step.
+      if (seed_n > 0) {
+        const mtp::MtpHead &hs = seed_n == 1 ? L.h1 : L.h2;
+        for (int j = 0; j < seed_n; j++) head_pend(L, (const float *)hs.hid.host() + (size_t)j * HCD, (int)u32(hs.tok)[j]);
+        seed_n = 0;
+      }
+      for (int j = 0; j < c; j++) head_pend(L, hvr + (size_t)j * HCD, j < c - 1 ? drafts[j] : out[k - 1]);
+      if ((int)L.pt.size() >= 136) {  // bound the host rows over long copies: whole 8-row KV-only groups now
+        L.Lh = Lh;
+        head_drain(L, false, 1);
+        Lh = L.Lh;
+      }
+    } else {
+      // head: keep the chain rows of accepted drafts, seed the next round from the verify hidden rows hk .. c - 1
+      const int hk = std::min(c - 1, Dd - 1);  // (Dd >= D: the gated verify checks a prefix of the chain)
+      Lh += seed_n + hk;
+      seed_n = c - hk;
+      mtp::MtpHead &hs = seed_n == 1 ? L.h1 : L.h2;
+      for (int j = 0; j < seed_n; j++) {
+        const int row = hk + j;
+        u32(hs.tok)[j] = (uint32_t)(row < c - 1 ? drafts[row] : out[k - 1]);
+        memcpy((float *)hs.hid.host() + (size_t)j * HCD, hvr + (size_t)row * HCD, (size_t)HCD * 4);
+      }
+    }
+    t1 = res.next_token;
+    const double wall = ms_since(tr);
+    if (copy) S.copy_rounds++, S.copy_tokens += c;
+    else if (!gate) pol.observe(D, a, wall);
+    if (sdraft && !copy) qgate_observe(L, drafts, q, D, a, R, wall + host_pre / 1e3, c);
+    if (L.rdump) {  // lab-verify: R, c, routes u16 [48][R][10]
+      const uint32_t *rc = (const uint32_t *)L.rcap.host();
+      std::vector<uint16_t> o = {(uint16_t)R, (uint16_t)c};
+      for (int l = 0; l < 48; l++)
+        for (int j = 0; j < R; j++)
+          for (int e = 0; e < TOPK; e++) o.push_back((uint16_t)rc[l * 160 + j * 20 + e]);
+      fwrite(o.data(), 2, o.size(), L.rdump);
+    }
+    if (L.trace)  // round D a c copy seed draft_gpu A_gpu B_gpu wall draft_wait B_commit host_pre_us gather_us drain_ms
+      fprintf(L.trace, "R %d %d %d %d %d %.3f %.3f %.3f %.3f %.3f %.3f %.1f %.1f %.3f %d\n", D, a, c, copy ? 1 : 0,
+              seed_n, dgpu, v.a->gpu_ms(), vb.gpu_ms(), wall, t_dw, t_bc, host_pre, gus, drain_ms, Dd);
+    if (L.trace && trace_q) {  // + per draft: its proposal probability q(d_j) and the proposal's top probability
+      fprintf(L.trace, "Q");
+      for (int j = 0; j < D; j++) fprintf(L.trace, " %.4f %.4f", trace_q[2 * j], trace_q[2 * j + 1]);
+      fprintf(L.trace, "\n");
+    }
+    if (T + 4 > m.tmax) done = true;  // no room for another round (D >= 1) plus the flush
+  }
+  S.decode_ms = ms_since(td);
+  S.tokens = k - 1;
+  if (L.trace) {
+    fprintf(L.trace, "end tokens %d rounds %d decode_ms %.1f copy_rounds %d copy_tokens %d\n", S.tokens, S.rounds,
+            S.decode_ms, S.copy_rounds, S.copy_tokens);
+    fflush(L.trace);
+  }
+  u32(L.xind)[0] = 0;
+  // ---- leave a clean state = prompt + out[0, k - 1) that plain steps, snapshots and mtp_generate_from continue:
+  // the last round's kept rows are still lazy (keep[0]); a 2-row verify over dummy tokens at pos T commits them
+  // (GDN ssm / conv, PLE conv) and its own rows stay pending (keep[0] = 0 drops them; KV rows >= T are past pos)
+  const bool flush_fits = T + 2 <= m.tmax;  // the dummy rows' KV positions T, T + 1
+  if (u32(L.keep)[0] > 0 && flush_fits) {
+    auto tf = clk::now();
+    MtpLoop::Verify &v = get_verify(L, 2, false, 0);
+    u32(L.xind)[0] = 0u;
+    u32(L.vtok)[0] = u32(L.vtok)[1] = (uint32_t)out[k - 1];
+    u32(m.pos)[0] = (uint32_t)T;
+    v.a->commit();
+    v.bg->commit();
+    v.a->wait();
+    v.bg->wait();
+    u32(L.keep)[0] = 0;
+    S.flush_ms = ms_since(tf);
+  }
+  u32(m.pos)[0] = (uint32_t)T;
+  // the head: KV rows [0, Lh); the seed rows [Lh, T) stay pending (the last one's token = the next one fed)
+  if (seed_n > 0) {
+    const mtp::MtpHead &hs = seed_n == 1 ? L.h1 : L.h2;
+    L.Lh = Lh;
+    L.ph.assign((const float *)hs.hid.host(), (const float *)hs.hid.host() + (size_t)seed_n * HCD);
+    L.pt.resize(seed_n);
+    for (int j = 0; j < seed_n; j++) L.pt[j] = j + 1 < seed_n ? (int)u32(hs.tok)[j] : -1;
+    NE_CHECK(L.Lh + seed_n == T, "head bookkeeping: Lh %d + %d pending != T %d", L.Lh, seed_n, T);
+  } else {  // the last round was a copy round: its pairs are pending already (lab-draft)
+    L.Lh = Lh;
+    NE_CHECK(!L.pt.empty() && L.Lh + (int)L.pt.size() == T, "head bookkeeping: Lh %d + %zu pending != T %d", L.Lh,
+             L.pt.size(), T);
+    L.pt.back() = -1;
+  }
+  m.gen++;
+  if (u32(L.keep)[0] > 0) {  // no room for the flush (the headroom above prevents it): dirty (reset before reuse)
+    m.dirty = true;
+  } else {
+    m.dirty = false;
+    L.head_gen = m.gen;
+  }
+  if (st) *st = S;
+  return k;
+}
+
+int mtp_verify_forced(MtpLoop &L, const int *prompt, int n, const int *cont, int nc, int R, const int *keeps,
+                      int nk, float *logits) {
+  Model &m = *L.m;
+  NE_CHECK(R >= 2 && R <= L.maxd + 1 && nk >= 1, "verify_forced: R %d", R);
+  reset(m);
+  ctx_reset(L, 0);
+  u32(L.keep)[0] = 0;
+  u32(L.xind)[0] = 0;   // raw logits out (lab-sampler: no bias / penalty transform)
+  prefill(m, prompt, n);
+  gdn_materialise(m.st);  // lab-gdnlazy
+  MtpLoop::Verify &v = get_verify(L, R, false, 0);
+  int i = 0, round = 0;
+  while (i + R <= nc && m.T + R <= m.tmax) {
+    for (int j = 0; j < R; j++) u32(L.vtok)[j] = (uint32_t)cont[i + j];
+    u32(m.pos)[0] = (uint32_t)m.T;
+    v.a->commit();
+    gather_ple_rows(m, m.hist[0], m.hist[1], cont + i, R, (float *)v.s.ple_emb.host());
+    v.bg->commit();
+    v.a->wait();
+    v.bg->wait();
+    const int kp = std::max(1, std::min(R, keeps[round++ % nk]));
+    memcpy(logits + (size_t)i * VOCAB, L.lg.host(), (size_t)kp * VOCAB * 4);
+    for (int j = 0; j < kp; j++) {
+      m.hist[0] = m.hist[1];
+      m.hist[1] = cont[i + j];
+    }
+    m.T += kp;
+    m.gen++;  // the head is not kept in step here
+    u32(L.keep)[0] = (uint32_t)kp;
+    i += kp;
+  }
+  m.dirty = true;
+  return i;
+}
+
+void mtp_time(MtpLoop &L, int R, int T, int P, int reps, double *verify_ms, double *draft_ms) {
+  Model &m = *L.m;
+  NE_CHECK(R >= 2 && R <= L.maxd + 1 && T + 2 * R <= m.tmax && P >= 0 && P <= 8, "mtp_time: R %d T %d P %d", R, T, P);
+  reset(m);
+  u32(L.xind)[0] = 0;
+  MtpLoop::Verify &v = get_verify(L, R, false, 0);
+  Recorder &dr = get_draft(L, 1, R - 1, false);
+  std::vector<double> g, d;
+  for (int i = 0; i < reps + 2; i++) {
+    for (int j = 0; j < R; j++) u32(L.vtok)[j] = (uint32_t)(1000 + 7 * i + j);
+    u32(L.keep)[0] = (uint32_t)P;
+    u32(m.pos)[0] = (uint32_t)T;
+    u32(L.h1.st.pos)[0] = (uint32_t)T;
+    dr.run();
+    v.a->run();
+    v.bg->run();
+    if (i >= 2) {
+      g.push_back(v.a->gpu_ms() + v.bg->gpu_ms());
+      d.push_back(dr.gpu_ms());
+    }
+  }
+  std::sort(g.begin(), g.end());
+  std::sort(d.begin(), d.end());
+  *verify_ms = g[g.size() / 2];
+  *draft_ms = d[d.size() / 2];
+  reset(m);
+}
+
+// lab-draft: GPU ms (median of reps, each piece its own recording / command buffer) of a draft round's parts at head
+// position T: see mtp_loop.h ne_fn_mtp_prof for the layout. Leaves the model reset.
+int mtp_prof(MtpLoop &L, int T, int reps, double *out, int nout) {
+  Model &m = *L.m;
+  NE_CHECK(T + 16 <= m.tmax && reps >= 1, "mtp_prof: T %d", T);
+  reset(m);
+  u32(L.xind)[0] = 0;
+  u32(L.keep)[0] = 0;
+  {
+    DraftSP d{1.0f, 0.95f, 20u, 12345u, 0, (uint32_t)L.W.shortlist, 0, 0};
+    memcpy(L.dsp.host(), &d, sizeof(d));
+  }
+  for (int j = 0; j < 16; j++) u32(L.h1.tok)[j] = u32(L.h2.tok)[j] = u32(L.vtok)[j] = (uint32_t)(1000 + 7 * j);
+  auto med = [&](Recorder &r, bool verify = false, Recorder *b = nullptr) {
+    std::vector<double> g;
+    for (int i = 0; i < reps + 2; i++) {
+      u32(L.h1.st.pos)[0] = (uint32_t)T;
+      u32(m.pos)[0] = (uint32_t)T;
+      r.commit();
+      if (b) b->commit();
+      r.wait();
+      if (b) b->wait();
+      if (i >= 2) g.push_back(r.gpu_ms() + (b ? b->gpu_ms() : 0.0));
+    }
+    std::sort(g.begin(), g.end());
+    return g[g.size() / 2];
+  };
+  auto rec = [&](auto f) {
+    auto r = std::make_unique<Recorder>();
+    r->begin();
+    f(*r);
+    r->end();
+    return r;
+  };
+  std::vector<double> v;
+  const mtp::MtpW &W = L.W;
+  v.push_back(med(*rec([&](Recorder &r) { mtp::record_step(r, W, L.h1); })));
+  v.push_back(med(*rec([&](Recorder &r) { mtp::record_step(r, W, L.h1, nullptr, nullptr, nullptr, 0, false); })));
+  v.push_back(med(*rec([&](Recorder &r) { mtp::record_kv_step(r, W, L.h1, L.h1.tok, L.h1.hid); })));
+  const uint32_t V = (uint32_t)(W.draft_bits ? W.draft_head.rows : W.vocab), Kk = (uint32_t)W.shortlist;
+  if (W.draft_bits) {
+    const uint32_t mapped = W.draft_ids.buf ? 1u : 0u, at = 0;
+    v.push_back(med(*rec([&](Recorder &r) { nax::record_qn(r, 1, L.h1.xh, W.draft_head, W.draft_bits, L.h1.logits); })));
+    v.push_back(med(*rec([&](Recorder &r) {
+      r.dispatch(pso("mtp_topk_local"), {L.h1.logits, L.h1.cand, Arg::value(V), Arg::value(Kk)}, MTLSizeMake(128, 1, 1), sz(256));
+    })));
+    v.push_back(med(*rec([&](Recorder &r) {
+      r.dispatch(pso("mtp_shortlist"), {L.h1.cand, L.h1.xh, W.lm_head.w, W.lm_head.s, W.lm_head.b, L.h1.amax, L.h1.sl,
+                                            Arg::value(V), Arg::value(at), Arg::value(Kk), mapped ? W.draft_ids : L.h1.amax,
+                                            Arg::value(mapped)}, sz(1), sz(1024));
+    })));
+    v.push_back(med(*rec([&](Recorder &r) {
+      r.dispatch(pso("mtp_draft_sample", 32), {L.h1.sl, L.h1.amax, L.qb, L.dsp, Arg::value(1u)}, sz(1), sz(32));
+    })));
+  } else {
+    v.insert(v.end(), {0, 0, 0, 0});
+  }
+  v.push_back(med(*rec([&](Recorder &r) {
+    nax::record_q8(r, 1, L.h1.xh, {&W.lm_head}, {L.lg});
+    r.barrier();
+    r.dispatch(pso("mtp_argmax", 1024), {L.lg, L.amv, Arg::value((uint32_t)VOCAB), Arg::value(0u)}, sz(1), sz(1024));
+  })));
+  v.push_back(med(*rec([&](Recorder &r) { mtp::record_step(r, W, L.h2); })));
+  for (int n = 1; n <= 2; n++)
+    for (int D = 1; D <= 4; D++)
+      v.push_back(D <= L.maxd && W.draft_bits ? med(get_draft(L, n, D, true)) : 0.0);
+  for (int sd = 1; sd >= 0; sd--)
+    for (int R = 2; R <= 5; R++) {
+      if (R > L.maxd + 1) { v.push_back(0); continue; }
+      MtpLoop::Verify &vv = get_verify(L, R, sd, 20);
+      v.push_back(med(*vv.a, true, sd ? vv.bs.get() : vv.bg.get()));
+    }
+  reset(m);
+  ctx_reset(L, 0);
+  const int k = std::min<int>(nout, (int)v.size());
+  for (int i = 0; i < k; i++) out[i] = v[i];
+  return (int)v.size();
+}
+
+}  // namespace ne::fn
+
+// ------------------------------------------------------------------------------------------------ C entry points
+using namespace ne;
+using namespace ne::fn;
+
+struct ne_fn_mtp {
+  MtpLoopPtr p;
+  int maxd = 0;
+  ne_fn_model *model = nullptr;
+};
+struct ne_fn_mtp_snap {
+  ne_fn_snap *ms = nullptr;
+  bool head = false;
+  int Lh = 0;
+  std::vector<float> ph;
+  std::vector<int> pt;
+  std::vector<int> ctx;  // lab-draft: the copy rule's token history (positions [ctx0, T))
+  int ctx0 = 0;
+  ~ne_fn_mtp_snap() { ne_fn_snap_free(ms); }
+};
+static void stats_out(const MtpStats &s, int maxd, double *stats, int *hist) {
+  if (stats) {
+    const double r = std::max(1, s.rounds);
+    const double v[11] = {s.prefill_ms,       s.head_prefill_ms,   s.decode_ms,         (double)s.tokens,
+                          (double)s.rounds,   s.draft_gpu_ms / r,  s.verify_gpu_ms / r, s.gather_us / r,
+                          s.host_us / r,      (double)maxd,        s.flush_ms};
+    memcpy(stats, v, 10 * sizeof(double));  // 10 doubles (the old layout); flush ms only through generate_from
+  }
+  if (hist) for (size_t i = 0; i < s.hist.size(); i++) hist[i] = s.hist[i];
+}
+
+extern "C" {
+
+NE_API ne_fn_mtp *ne_fn_mtp_create(ne_fn_model *m, int max_depth, int draft_bits) {
+  ne_fn_mtp *out = nullptr;
+  int rc = c_call([&] {
+    NE_CHECK(m && m->m, "null model");
+    auto u = std::make_unique<ne_fn_mtp>();
+    u->p = mtp_create(*m->m, max_depth, draft_bits);
+    u->maxd = max_depth;
+    u->model = m;
+    out = u.release();
+  });
+  return rc == 0 ? out : nullptr;
+}
+
+NE_API void ne_fn_mtp_free(ne_fn_mtp *p) { delete p; }
+
+NE_API int ne_fn_mtp_time(ne_fn_mtp *p, int R, int T, int P, int reps, double *verify_ms, double *draft_ms) {
+  return c_call([&] {
+    NE_CHECK(p && verify_ms && draft_ms, "null argument");
+    mtp_time(*p->p, R, T, P, reps, verify_ms, draft_ms);
+  });
+}
+
+NE_API int ne_fn_mtp_set_copy(ne_fn_mtp *p, int min_match, int depth) {
+  return c_call([&] {
+    NE_CHECK(p && min_match >= 0, "bad arguments");
+    MtpLoop &L = *p->p;
+    if (min_match > 0 && L.copy_min <= 0) ctx_reset(L, L.m->T);  // the history starts now
+    L.copy_min = min_match;
+    L.cidx.clear();
+    if (min_match <= 0) ctx_reset(L, L.m->T);
+    L.copy_maxd = depth > 0 ? std::min(depth, L.maxd) : L.maxd;
+  });
+}
+NE_API int ne_fn_mtp_set_qgate(ne_fn_mtp *p, int on) {
+  return c_call([&] {
+    NE_CHECK(p, "null argument");
+    p->p->qgate = on > 0;
+  });
+}
+// lab-verify: routed experts deduplicated across the verify rows (g_moe_dedupe) on / off; re-records every verify
+static void rerecord_verifies(MtpLoop &L) {
+    for (auto &kv : L.ver) {
+      kv.second.a.reset();
+      kv.second.bg.reset();
+      kv.second.bs.reset();
+    }
+    for (int R = 2; R <= L.maxd + 1; R++) {  // record + first replays now (as at creation), then reset the model
+      MtpLoop::Verify &v = get_verify(L, R, false, 0);
+      get_verify(L, R, true, 20);
+      v.a->run();
+      v.bg->run();
+      v.bs->run();
+    }
+    reset(*L.m);
+}
+NE_API int ne_fn_mtp_set_moe_dedupe(ne_fn_mtp *p, int on) {
+  return c_call([&] {
+    NE_CHECK(p, "null argument");
+    const int v = on == 1 ? 8 : std::max(0, on);  // 1 = every R, N >= 2 = R <= N, 0 = off
+    if (g_moe_dedupe == v) return;
+    g_moe_dedupe = v;
+    rerecord_verifies(*p->p);
+  });
+}
+// lab-verify: routed gate / up split by multiplicity (g_moe_split) on / off; re-records the verifies
+NE_API int ne_fn_mtp_set_moe_split(ne_fn_mtp *p, int on) {
+  return c_call([&] {
+    NE_CHECK(p, "null argument");
+    if (g_moe_split == (on > 0)) return;
+    g_moe_split = on > 0;
+    rerecord_verifies(*p->p);
+  });
+}
+NE_API int ne_fn_mtp_set_draft_vocab(ne_fn_mtp *p, const char *mode) {
+  return c_call([&] {
+    NE_CHECK(p && mode, "null argument");
+    MtpLoop &L = *p->p;
+    NE_CHECK(L.W.draft_bits, "no draft readout (draft_bits 0)");
+    const char *old = getenv("NE_MTP_DRAFT_VOCAB");
+    const std::string keep = old ? old : "";
+    setenv("NE_MTP_DRAFT_VOCAB", mode, 1);
+    const std::vector<uint32_t> rows = mtp::draft_vocab_rows(L.W.vocab);
+    if (old) setenv("NE_MTP_DRAFT_VOCAB", keep.c_str(), 1); else unsetenv("NE_MTP_DRAFT_VOCAB");
+    mtp::set_draft_head(L.W, L.W.draft_bits, L.W.shortlist, &rows);
+    L.dr.clear();  // the draft recordings bind the draft head: record and replay them again
+    for (int n = 1; n <= 2; n++)
+      for (int D = 1; D <= L.maxd; D++)
+        for (int sd = 0; sd < 2; sd++) get_draft(L, n, D, sd).run();
+    reset(*L.m);
+  });
+}
+
+NE_API int ne_fn_mtp_prof(ne_fn_mtp *p, int T, int reps, double *out, int nout) {
+  int n = -1;
+  int rc = c_call([&] {
+    NE_CHECK(p && out && nout >= 0, "null argument");
+    n = mtp_prof(*p->p, T, reps, out, nout);
+  });
+  return rc == 0 ? n : -1;
+}
+
+NE_API int ne_fn_mtp_verify_forced(ne_fn_mtp *p, const int *prompt, int n, const int *cont, int nc, int R,
+                                   const int *keeps, int nk, float *logits) {
+  int count = -1;
+  int rc = c_call([&] {
+    NE_CHECK(p && prompt && cont && keeps && logits, "null argument");
+    count = mtp_verify_forced(*p->p, prompt, n, cont, nc, R, keeps, nk, logits);
+  });
+  return rc == 0 ? count : -1;
+}
+
+NE_API int ne_fn_mtp_generate(ne_fn_mtp *p, const int *prompt, int n, int max_new, int stop, int depth,
+                              uint64_t seed, int *out, double *stats, int *hist) {
+  return ne_fn_mtp_generate_cb(p, prompt, n, max_new, stop, depth, seed, out, stats, hist, nullptr, nullptr);
+}
+
+NE_API int ne_fn_mtp_generate_cb(ne_fn_mtp *p, const int *prompt, int n, int max_new, int stop, int depth,
+                                 uint64_t seed, int *out, double *stats, int *hist, int (*cb)(void *, const int *, int),
+                                 void *cb_ctx) {
+  int count = -1;
+  int rc = c_call([&] {
+    NE_CHECK(p && prompt && out, "null argument");
+    MtpStats s;
+    count = mtp_generate(*p->p, prompt, n, max_new, stop, depth, seed, out, &s, cb, cb_ctx);
+    stats_out(s, p->maxd, stats, hist);
+  });
+  return rc == 0 ? count : -1;
+}
+
+NE_API int ne_fn_mtp_head_ok(ne_fn_mtp *p) {
+  int ok = 0;
+  int rc = c_call([&] {
+    NE_CHECK(p, "null argument");
+    ok = mtp_head_ok(*p->p) ? 1 : 0;
+  });
+  return rc == 0 ? ok : -1;
+}
+
+NE_API int ne_fn_mtp_head_state(ne_fn_mtp *p, int *Lh, int *npend) {
+  return c_call([&] {
+    NE_CHECK(p, "null argument");
+    if (Lh) *Lh = p->p->Lh;
+    if (npend) *npend = (int)p->p->pt.size();
+  });
+}
+
+NE_API int ne_fn_mtp_catch_up(ne_fn_mtp *p, double *ms) {
+  return c_call([&] {
+    NE_CHECK(p, "null argument");
+    const double t = mtp_catch_up(*p->p);
+    if (ms) *ms = t;
+  });
+}
+
+NE_API int ne_fn_mtp_set_pend_cap(ne_fn_mtp *p, int cap) {
+  return c_call([&] {
+    NE_CHECK(p, "null argument");
+    mtp_set_pend_cap(*p->p, cap);
+  });
+}
+
+NE_API int ne_fn_mtp_feed(ne_fn_mtp *p, const int *toks, int n) {
+  return c_call([&] {
+    NE_CHECK(p && toks, "null argument");
+    mtp_feed(*p->p, toks, n);
+  });
+}
+NE_API int ne_fn_mtp_touch(ne_fn_mtp *p) {
+  return c_call([&] {
+    NE_CHECK(p, "null argument");
+    MtpLoop &L = *p->p;
+    for (auto &e : L.ver)
+      for (Recorder *x : {e.second.a.get(), e.second.bg.get(), e.second.bs.get()})
+        if (x) x->touch();
+    for (auto &e : L.dr) e.second->touch();
+    for (Recorder *x : {L.hp8.get(), L.hp1.get(), L.hkG[0].get(), L.hkG[1].get(), L.hk8[0].get(), L.hk8[1].get(),
+                        L.hk1.get()})
+      if (x) x->touch();
+  });
+}
+NE_API int ne_fn_mtp_feed_ahead(ne_fn_mtp *p, const int *toks, int n, const int *ahead, int n_ahead) {
+  return c_call([&] {
+    NE_CHECK(p && toks && (ahead || n_ahead == 0) && n_ahead >= 0, "bad arguments");
+    mtp_feed(*p->p, toks, n, ahead, n_ahead);
+  });
+}
+
+NE_API int ne_fn_mtp_step(ne_fn_mtp *p, int tok, int *next, float *logprob) {
+  return c_call([&] {
+    NE_CHECK(p, "null argument");
+    StepOut o = mtp_step(*p->p, tok, true);
+    if (next) *next = o.token;
+    if (logprob) *logprob = o.logprob;
+  });
+}
+
+NE_API int ne_fn_mtp_generate_from(ne_fn_mtp *p, const int *toks, int n, int max_new, int stop, int depth,
+                                   uint64_t seed, int *out, double *stats, int *hist,
+                                   int (*cb)(void *, const int *, int), void *cb_ctx) {
+  int count = -1;
+  int rc = c_call([&] {
+    NE_CHECK(p && toks && out && n >= 1, "bad arguments");
+    MtpStats s;
+    count = mtp_generate_from(*p->p, toks, n, max_new, stop, depth, seed, out, &s, cb, cb_ctx);
+    stats_out(s, p->maxd, stats, hist);
+  });
+  return rc == 0 ? count : -1;
+}
+
+NE_API int ne_fn_mtp_context_len(ne_fn_mtp *p) {
+  int n = -1;
+  c_call([&] {
+    NE_CHECK(p, "null argument");
+    MtpLoop &L = *p->p;
+    n = L.ctx0 + (int)L.ctx.size() == L.m->T ? (int)L.ctx.size() : 0;
+  });
+  return n;
+}
+NE_API int ne_fn_mtp_set_context(ne_fn_mtp *p, const int *toks, int n) {
+  return c_call([&] {
+    NE_CHECK(p && (toks || n == 0) && n >= 0, "bad arguments");
+    MtpLoop &L = *p->p;
+    NE_CHECK(n <= L.m->T, "ne_fn_mtp_set_context: %d tokens for a state of %d", n, L.m->T);
+    for (int i = 0; i < n; i++) NE_CHECK(toks[i] >= 0 && toks[i] < VOCAB, "token %d out of range", toks[i]);
+    ctx_reset(L, L.m->T - n);
+    if (L.copy_min > 0) L.ctx.assign(toks, toks + n);
+  });
+}
+
+NE_API ne_fn_mtp_snap *ne_fn_mtp_snapshot(ne_fn_mtp *p) {
+  ne_fn_mtp_snap *out = nullptr;
+  c_call([&] {
+    NE_CHECK(p && p->model, "null argument");
+    MtpLoop &L = *p->p;
+    const bool head = mtp_head_ok(L);
+    if (head && !L.m->dirty) head_drain(L, false, 0);  // lazy head: catch up, so a snapshot holds <= 8 pending rows
+    ne_fn_snap *ms = ne_fn_model_snapshot(p->model);  // NULL (error set) on a dirty model
+    NE_CHECK(ms, "ne_fn_mtp_snapshot: %s", ne_last_error());
+    auto s = std::make_unique<ne_fn_mtp_snap>();
+    s->ms = ms;
+    s->head = head;
+    if (head) {
+      s->Lh = L.Lh;
+      s->ph = L.ph;
+      s->pt = L.pt;
+    }
+    if (L.ctx0 + (int)L.ctx.size() == ne_fn_snap_T(ms)) {
+      s->ctx = L.ctx;
+      s->ctx0 = L.ctx0;
+    } else {
+      s->ctx0 = ne_fn_snap_T(ms);
+    }
+    out = s.release();
+  });
+  return out;
+}
+
+NE_API int ne_fn_mtp_restore(ne_fn_mtp *p, const ne_fn_mtp_snap *s) {
+  return c_call([&] {
+    NE_CHECK(p && p->model && s && s->ms, "null argument");
+    NE_CHECK(ne_fn_model_restore(p->model, s->ms) == 0, "ne_fn_mtp_restore: %s", ne_last_error());
+    MtpLoop &L = *p->p;
+    if (s->head) {
+      L.Lh = s->Lh;
+      L.ph = s->ph;
+      L.pt = s->pt;
+      L.head_gen = L.m->gen;
+    } else {
+      head_invalidate(L);
+    }
+    ctx_reset(L, s->ctx0);
+    L.ctx = s->ctx;
+  });
+}
+
+NE_API int ne_fn_mtp_snap_T(const ne_fn_mtp_snap *s) { return s ? ne_fn_snap_T(s->ms) : -1; }
+NE_API int64_t ne_fn_mtp_snap_bytes(const ne_fn_mtp_snap *s) {
+  return s ? ne_fn_snap_bytes(s->ms) + (int64_t)(s->ph.size() * 4 + s->pt.size() * 4 + s->ctx.size() * 4) : -1;
+}
+NE_API void ne_fn_mtp_snap_free(ne_fn_mtp_snap *s) { delete s; }
+
+// ---- lab-srvcache: head KV rows and state <-> host buffers
+static constexpr int kMtpPendCap = 16;  // pending head rows a state buffer holds (in step, after a catch-up: <= 9)
+
+NE_API int64_t ne_fn_mtp_kv_bytes(ne_fn_mtp *p, int rows) {
+  int64_t n = -1;
+  c_call([&] {
+    NE_CHECK(p, "null argument");
+    n = kv_bytes({&p->p->h1.st.qc}, rows);
+  });
+  return n;
+}
+
+NE_API int ne_fn_mtp_kv_io(ne_fn_mtp *p, int to_model, int a, int b, void *buf, int rows) {
+  return c_call([&] {
+    NE_CHECK(p, "null argument");
+    kv_io({&p->p->h1.st.qc}, to_model != 0, a, b, buf, rows);
+  });
+}
+
+NE_API int64_t ne_fn_mtp_state_bytes(ne_fn_mtp *p) {
+  if (!p || !p->model) return -1;
+  return ne_fn_state_bytes(p->model) + (int64_t)kMtpPendCap * (HCD + 1) * 4;
+}
+
+NE_API int ne_fn_mtp_state_io(ne_fn_mtp *p, int to_model, void *buf, int64_t nbytes, int64_t *meta) {
+  return c_call([&] {
+    NE_CHECK(p && p->model && buf && meta, "null argument");
+    MtpLoop &L = *p->p;
+    const int64_t mb = ne_fn_state_bytes(p->model);
+    NE_CHECK(nbytes == ne_fn_mtp_state_bytes(p), "state buffer %lld B, want %lld", (long long)nbytes,
+             (long long)ne_fn_mtp_state_bytes(p));
+    float *ph = (float *)((char *)buf + mb);
+    int32_t *pt = (int32_t *)(ph + (size_t)kMtpPendCap * HCD);
+    if (to_model) {
+      if (meta[3]) {  // checked before the model state is touched
+        NE_CHECK(meta[5] >= 0 && meta[5] <= kMtpPendCap, "pending rows %lld", (long long)meta[5]);
+        NE_CHECK(meta[4] >= 0 && meta[4] + meta[5] == meta[0], "head: KV length %lld + %lld pending != T %lld",
+                 (long long)meta[4], (long long)meta[5], (long long)meta[0]);
+      }
+      NE_CHECK(ne_fn_state_io(p->model, 1, buf, mb, meta) == 0, "%s", ne_last_error());  // bumps Model::gen
+      if (meta[3]) {
+        L.Lh = (int)meta[4];
+        L.ph.assign(ph, ph + (size_t)meta[5] * HCD);
+        L.pt.assign(pt, pt + meta[5]);
+        L.head_gen = L.m->gen;
+      } else {
+        head_invalidate(L);
+      }
+      ctx_reset(L, L.m->T);  // the tokens are unknown here (ne_fn_mtp_set_context gives them)
+    } else {
+      const bool head = mtp_head_ok(L);
+      if (head && !L.m->dirty) head_drain(L, false, 0);  // lazy head (lab-headlazy): catch up, <= 8 rows stay pending
+      if (head)  // a stale head's rows are not exported (meta[3] = 0)
+        NE_CHECK(L.pt.size() <= (size_t)kMtpPendCap && L.ph.size() == L.pt.size() * HCD, "head: %zu pending rows",
+                 L.pt.size());
+      NE_CHECK(ne_fn_state_io(p->model, 0, buf, mb, meta) == 0, "%s", ne_last_error());
+      meta[3] = head ? 1 : 0;
+      meta[4] = head ? L.Lh : 0;
+      meta[5] = head ? (int64_t)L.pt.size() : 0;
+      if (head) {
+        memcpy(ph, L.ph.data(), L.ph.size() * 4);
+        memcpy(pt, L.pt.data(), L.pt.size() * 4);
+      }
+    }
+  });
+}
+
+}  // extern "C"

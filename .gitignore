@@ -1,0 +1,8 @@
+build/
+*.metallib
+*.air
+__pycache__/
+tests/golden/data/
+.venv/
+build-server/
+tests/golden/READY

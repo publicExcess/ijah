@@ -1,0 +1,173 @@
+diff --git a/models/flash_next/prefill.mm b/models/flash_next/prefill.mm
+index 4e325a4..81da23c 100644
+--- a/models/flash_next/prefill.mm
++++ b/models/flash_next/prefill.mm
+@@ -12,6 +12,8 @@
+ //        finish (H128 * svh * w, fixed slot order, + gated shared, HC write)
+ #include "models/flash_next/prefill.h"
+ 
++#include "kernels/attn/qsa_chunk.h"
++
+ #include <dispatch/dispatch.h>
+ #include <unistd.h>
+ 
+@@ -37,15 +39,13 @@ struct Prefill {
+   Tensor normed, inj, down, up, xin;               // HC read
+   Tensor raw, z, araw, braw, conv, gb, qk, y, o, br;  // GDN (+ the bf16 branch of either mixer)
+   Tensor aq, akv, aiqk, aout;                      // attention (f32, lab-attn's layouts)
+-  Tensor qb, ob;                                   // dense rows: prepped q, NAX attention output (bf16 [C][24][256])
+   bool scan_tb = true;    // NE_PF_SCAN=plain: pf_gdn_scan (no staging)
+   bool no_dense = false;                           // NE_PF_DENSE=0: every row through lab-attn's step
+   Tensor logits, route, sgl, gu, sact, sho;        // MoE routing + shared expert
+   Tensor cnt, rank, off, wtab, order, seid, inv, pg, pu, ig, iu, pd, dn;  // routed experts
+   Tensor pemb_f, pemb, pkv, pgv, pnrm;             // PLE
+   Tensor posbase;                                  // u32 [4]: T before the chunk
+-  Tensor pslot;                                    // u32 [kSlots][4]: per attention slice position
+-  std::vector<attn::QsaCache> slot;                // per-slice step scratch (lab-attn's shapes)
++  attn::ChunkScratch ac;                           // lab-attn's chunk attention scratch (kernels/attn/qsa_chunk.h)
+   int maxwin = 0, win = 32;  // MoE GEMM windows: rows per window (32 or 64, NE_PF_WIN), max count
+   // recordings by chunk length; profile mode: one recorder per (layer, stage) segment
+   struct Rec {
+@@ -59,8 +59,6 @@ struct Prefill {
+   PfStats stats;
+ };
+ 
+-constexpr int kSlots = 16;  // concurrent attention slices (8 rows each)
+-
+ static MTLSize sz1(int n) { return MTLSizeMake(n, 1, 1); }
+ static int cdiv(int a, int b) { return (a + b - 1) / b; }
+ static Arg at(const Tensor &t, size_t byte_off = 0) { return Arg(t.buf, t.offset + byte_off); }
+@@ -149,15 +147,7 @@ static void record_gdn(Prefill &p, Seg &sg, const LayerW &w, GdnState &st, int n
+   c.barrier();
+ }
+ 
+-// MLX AttnParams (kernels/prefill/mlx/attn_params.h)
+-struct PfAttnParams {
+-  int B, H, D, qL, kL, gqa_factor;
+-  float scale;
+-  int NQ, NK, NQ_aligned, NK_aligned, qL_rem, kL_rem, qL_off;
+-  int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
+-};
+ // rows [0, nd) of the chunk are dense (their QSA selection is every block: complete blocks (pos + 1) / 4 <= 512)
+-static int dense_rows(int T0, int n) { return T0 < 0 ? 0 : std::max(0, std::min(n, 4 * attn::KB + 3 - T0)); }
+ 
+ static void record_attn(Prefill &p, Seg &sg, const LayerW &w, GdnState &st, int n, int T0) {
+   const AttnW &a = w.attn;
+@@ -168,69 +158,10 @@ static void record_attn(Prefill &p, Seg &sg, const LayerW &w, GdnState &st, int
+   gemm(g, a.v, at(p.xin), false, HID, at(p.akv, (size_t)AKVD * 4), true, 2 * AKVD, n);
+   gemm(g, a.iqk, at(p.xin), false, HID, at(p.aiqk), true, AIQD, n);
+   g.barrier();
+-  // lab-attn's step per 8-row slice. Slices are independent except through the caches, so: per group of kSlots
+-  // slices, the preps (cache append, block keys) run in order, then each of the other 5 dispatches for all slices
+-  // at once, each slice on its own position (pslot) and step scratch (p.slot).
++  // lab-attn's chunk attention core: cache append / indexer / selection per 8-row slice, dense rows on the NAX
++  // flash attention, the other rows in one multi-row dispatch (kernels/attn/qsa_chunk.h)
+   Recorder &r = sg.r(PfStage::Attn);
+-  const int ns = cdiv(n, attn::MAX_ROWS);
+-  // dense slices (all rows dense; bf16 KV): prep only + q copy, then one NAX flash attention over them
+-  const bool nax = st.qc.fmt == attn::KvFmt::BF16 && !p.no_dense;
+-  const int nds = nax ? dense_rows(T0, n) / attn::MAX_ROWS : 0, ndr = nds * attn::MAX_ROWS;
+-  for (int g0 = 0; g0 < ns; g0 += kSlots) {
+-    const int gs = std::min(kSlots, ns - g0);
+-    r.dispatch(pso("pf_set_pos_multi", 32),
+-               {p.pslot, p.posbase, Arg::value((uint32_t)(g0 * attn::MAX_ROWS)), Arg::value((uint32_t)gs)}, sz1(1),
+-               sz1(32));
+-    r.barrier();
+-    std::vector<attn::QsaCache> cs(gs);
+-    std::vector<int> R(gs), r0(gs);
+-    for (int j = 0; j < gs; j++) {
+-      attn::QsaCache c = st.qc;
+-      const attn::QsaCache &d = p.slot[j];
+-      c.qr = d.qr; c.iq = d.iq; c.scores = d.scores; c.sel = d.sel; c.nsel = d.nsel; c.cand = d.cand; c.part = d.part;
+-      c.scratch_tmax = d.scratch_tmax;
+-      c.pos = p.pslot.view((size_t)j * 16, DType::U32, {4});
+-      cs[j] = c;
+-      r0[j] = (g0 + j) * attn::MAX_ROWS;
+-      R[j] = std::min(attn::MAX_ROWS, n - r0[j]);
+-    }
+-    for (int which = 0; which < attn::kNumDispatches; which++) {
+-      bool any = false;
+-      for (int j = 0; j < gs; j++) {
+-        const bool dense = g0 + j < nds;
+-        if (which > 0 && dense) continue;
+-        attn::record_one(r, which, w.qsa, cs[j], R[j], p.aq.rows(r0[j], R[j]), p.akv.rows(r0[j], R[j]),
+-                         p.aiqk.rows(r0[j], R[j]), p.aout.rows(r0[j], R[j]));
+-        any = true;
+-        if (which == 0) {
+-          r.barrier();  // preps in order (block keys may span slices)
+-          if (dense) {  // the slice's prepped queries -> qb (before the next group reuses the scratch)
+-            const uint32_t cnt = (uint32_t)R[j] * attn::NQH * attn::HD;
+-            r.dispatch(pso("pf_attn_qcopy", 256), {cs[j].qr, p.qb, Arg::value((uint32_t)r0[j]), Arg::value(cnt)},
+-                       sz1(cdiv((int)cnt, 256)), sz1(256));
+-          }
+-        }
+-      }
+-      if (which > 0 && any) r.barrier();
+-    }
+-  }
+-  if (nds > 0) {
+-    r.barrier();
+-    const int qL = ndr, kL = T0 + ndr, tq = st.qc.tmax;
+-    PfAttnParams ap{};
+-    ap.B = 1; ap.H = attn::NQH; ap.D = attn::HD; ap.qL = qL; ap.kL = kL; ap.gqa_factor = attn::NQH / attn::NKV;
+-    ap.scale = 1.0f;  // lab-attn's prepped q carries the 1/16
+-    ap.NQ = cdiv(qL, 64); ap.NK = cdiv(kL, 32); ap.NQ_aligned = qL / 64; ap.NK_aligned = kL / 32;
+-    ap.qL_rem = qL - ap.NQ_aligned * 64; ap.kL_rem = kL - ap.NK_aligned * 32; ap.qL_off = kL - qL;
+-    const int64_t qs[3] = {(int64_t)n * AOD, attn::HD, AOD}, ks[3] = {0, (int64_t)tq * attn::HD, attn::HD};
+-    for (int i = 0; i < 3; i++) { ap.Q_strides[i] = ap.O_strides[i] = qs[i]; ap.K_strides[i] = ap.V_strides[i] = ks[i]; }
+-    auto ps = Pipelines::get("pf_attn_nax_d256", {FC::b(0, g_ref_round), FC::b(200, qL % 64 == 0), FC::b(201, kL % 32 == 0),
+-                                                  FC::b(300, false), FC::b(301, true), FC::b(302, false)});
+-    r.dispatch(ps, {p.qb, st.qc.kc, st.qc.vc, p.ob, Arg::value(ap)}, MTLSizeMake(ap.NQ, attn::NQH, 1), sz1(256));
+-    r.barrier();
+-    pointwise(r, "pf_attn_gate", {p.ob, p.aq, p.aout}, (uint32_t)ndr * AOD);
+-    r.barrier();
+-  }
++  attn::record_chunk(r, w.qsa, st.qc, p.ac, n, p.no_dense ? -1 : T0, p.posbase, p.aq, p.akv, p.aiqk, p.aout);
+   Recorder &c = sg.r(PfStage::TrunkGemm);
+   gemm(c, a.o, at(p.aout), true, AOD, at(p.br), false, HID, n);
+   c.barrier();
+@@ -384,8 +315,6 @@ PrefillPtr prefill_create(Model &m, int chunk, bool profile) {
+   p->akv = alloc(DType::F32, {C, 2 * AKVD});
+   p->aiqk = alloc(DType::F32, {C, AIQD});
+   p->aout = alloc(DType::F32, {C, AOD});
+-  p->qb = alloc(DType::BF16, {C, AOD});
+-  p->ob = alloc(DType::BF16, {C, AOD});
+   if (const char *e = getenv("NE_PF_DENSE")) p->no_dense = std::string(e) == "0";
+   if (const char *e = getenv("NE_PF_SCAN")) p->scan_tb = std::string(e) != "plain";
+   p->logits = alloc(DType::BF16, {C, NE});
+@@ -413,25 +342,11 @@ PrefillPtr prefill_create(Model &m, int chunk, bool profile) {
+   p->pgv = alloc(DType::BF16, {C, HCD});
+   p->pnrm = alloc(DType::BF16, {C, HCD});
+   p->posbase = alloc(DType::U32, {4});
+-  p->pslot = alloc(DType::U32, {kSlots, 4});
+   int tq = 0;
+   attn::KvFmt fmt = attn::KvFmt::BF16;
+   for (auto &st : m.st)
+     if (st.qc.tmax > 0) { tq = std::max(tq, st.qc.tmax); fmt = st.qc.fmt; }
+-  if (tq > 0)
+-    for (int j = 0; j < kSlots; j++) {  // = attn::alloc_cache's scratch part (kernels/attn/qsa.mm)
+-      attn::QsaCache c;
+-      c.fmt = fmt;
+-      c.scratch_tmax = tq;
+-      c.qr = alloc(DType::F32, {attn::MAX_ROWS, attn::NQH, attn::HD});
+-      c.iq = alloc(DType::F32, {attn::MAX_ROWS, 4, attn::IHD});
+-      c.scores = alloc(DType::F32, {attn::MAX_ROWS, tq / attn::RATIO});
+-      c.sel = alloc(DType::U32, {attn::MAX_ROWS, attn::KB});
+-      c.nsel = alloc(DType::U32, {attn::MAX_ROWS});
+-      c.cand = alloc(DType::U32, {attn::MAX_ROWS, (tq / attn::RATIO + attn::SLICE - 1) / attn::SLICE, attn::KB});
+-      c.part = alloc(DType::F32, {attn::NKV, attn::MAX_ROWS, attn::NCH, 16, attn::HD + 2});
+-      p->slot.push_back(c);
+-    }
++  if (tq > 0) p->ac = attn::alloc_chunk_scratch(fmt, tq, C);
+   return p;
+ }
+ 
+@@ -485,7 +400,7 @@ void prefill_tokens(Prefill &p, const int *tokens, int n) {
+   gather(0, std::min(p.C, n), m.hist[0], m.hist[1], next_emb);
+   for (int c0 = 0; c0 < n; c0 += p.C) {
+     const int cn = std::min(p.C, n - c0);
+-    const bool has_dense = !p.no_dense && dense_rows(m.T, cn) >= attn::MAX_ROWS;
++    const bool has_dense = !p.no_dense && p.ac.C > 0 && attn::chunk_dense_rows(p.ac, m.T, cn) > 0;
+     Prefill::Rec &rec = get_rec(p, cn, has_dense ? m.T : -1);
+     uint32_t *tk = (uint32_t *)p.tok.host();
+     for (int i = 0; i < cn; i++) tk[i] = (uint32_t)tokens[c0 + i];

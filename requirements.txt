@@ -1,0 +1,7 @@
+# Ijah server + CPU tests (python3.11+). make venv / tools/setup.sh installs this into .venv.
+tokenizers==0.23.3      # server/chat.py, the tests: the pack's tokenizer.json
+jinja2==3.1.6           # server/chat.py: the pack's chat_template.jinja
+numpy==2.3.5            # server, tools/engine.py (ctypes binding), tests
+pillow==12.3.0          # server/vision.py: image decoding
+xgrammar==0.2.8         # server/grammar.py: structured output / forced tool calls (pulls in torch + transformers)
+jsonschema==4.26.0      # tests/server/test_grammar.py, test_structured.py

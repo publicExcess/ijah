@@ -1,0 +1,6 @@
+# Optional: the MLX reference side of the tests (goldens, reference logits, the vision tower reference, KLD vs the
+# bf16 teacher). Also needs the EXL3 reference modules (IJAH_REF_DIR), which are not part of this repository.
+#   .venv/bin/python -m pip install -r requirements-ref.txt
+-r requirements.txt
+mlx==0.32.3
+mlx-vlm==0.7.7
