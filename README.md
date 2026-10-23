@@ -167,6 +167,9 @@ Machine: Apple M5 Max (40-core GPU), 128 GB, macOS 27, 23 October 2026.
 | oMLX · oQ4e: Jundot, mixed 4-8-bit (4.72 bpw) | 92.3 [86.4, 98.2] | 2,184 (1,744-2,342) | 2,713 (2,701-2,732) |
 <!-- /speed-table -->
 
+The drafter does not slow prefill: the ~8% gap between the two T6 rows above is run-to-run spread. Back to back on one
+server, a cold 44K-token prompt prefilled at 2,008 tok/s with DFlash2 and 2,016 without.
+
 ## Limitations
 
 - **Speed parity, not a speed win.** With 4-bit experts Ijah runs at about the speed of the other 4-bit engines. Its
