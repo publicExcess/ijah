@@ -125,7 +125,7 @@ def long_sources():
     for pat in ("models/flash_next/*.h", "models/flash_next/*.mm", "models/flash_next/*.metal", "tools/*.py"):
         for f in sorted(f for f in ROOT.glob(pat) if f.name != "draft_vocab.h"):   # (a 100K-token id table)
             code.append(f"==== {f.relative_to(ROOT)} ====\n" + f.read_text(encoding="utf-8"))
-    web = (Path.home() / "Models/splash/swift-splash-project/evaluation/corpora/mixedweb-v1.txt").read_text(encoding="utf-8")
+    web = (obc / "mixedweb-v1.txt").read_text(encoding="utf-8")
     return {"prose": novel[novel.find("Call me Ishmael."):], "code": "\n".join(code), "web": web}
 
 
