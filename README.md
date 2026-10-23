@@ -150,8 +150,7 @@ engines. The GGUFs were scored from llama.cpp's full-vocabulary f32 logits, not 
 
 **Speed.** One streaming OpenAI-compatible client for every engine, one engine loaded at a time, sampling at
 temperature 1.0, top-p 0.95, top-k 20, with thinking on at medium effort. <!-- speed-n -->Decode: 6 prompts (code, maths, prose) x 3 seeds, 1,024 generated tokens each. We report the mean with a 95% confidence interval. Prefill: cold 10K and 32K-token prompts with no cache hit, 3 runs each, timed to the first streamed token, as the median with the min-max range.<!-- /speed-n -->
-Engines: Ijah T6 and Ijah 4-bit with MTP and the DFlash2 drafter (the default since v0.2), and Ijah T6 with MTP alone
-(`--drafter none`);
+Engines: Ijah T6 and Ijah 4-bit with the DFlash2 drafter and the MTP head (the default since v0.2);
 Splash 1.4.0 (source build) at its defaults, which include its DFlash2 drafter and int8 KV; oMLX 0.7.1.dev1 with MTP
 at depth 2 and INT8-activation prefill.
 Machine: Apple M5 Max (40-core GPU), 128 GB, macOS 27, 23 October 2026.
@@ -160,15 +159,14 @@ Machine: Apple M5 Max (40-core GPU), 128 GB, macOS 27, 23 October 2026.
 | engine + weights | decode tok/s (mean, 95% CI) | prefill 10K tok/s (median, min-max) | prefill 32K tok/s (median, min-max) |
 |---|---:|---:|---:|
 | Ijah T6 + DFlash2: EXL3, 5-bit experts, 6/8-bit trunk | 122.3 [113.8, 130.4] | 1,867 (1,858-2,202) | 1,898 (1,884-1,907) |
-| Ijah T6 (MTP): EXL3, 5-bit experts, 6/8-bit trunk | 111.3 [107.0, 115.4] | 2,040 (2,037-2,071) | 2,043 (2,039-2,050) |
 | Ijah 4-bit + DFlash2: EXL3, 4-bit experts, 6/8-bit trunk | 133.0 [123.1, 142.2] | 2,210 (2,059-2,370) | 2,110 (2,106-2,113) |
 | Splash 1.4 · UD-IQ4_XS: Unsloth GGUF, mostly 3-bit experts | 128.1 [114.9, 141.2] | 2,296 (2,295-2,301) | 2,191 (2,188-2,217) |
 | Splash 1.4 · Q4_0: bartowski GGUF, 4-bit | 131.5 [119.5, 143.7] | 2,474 (2,401-2,511) | 2,281 (2,266-2,293) |
 | oMLX · oQ4e: Jundot, mixed 4-8-bit (4.72 bpw) | 92.3 [86.4, 98.2] | 2,184 (1,744-2,342) | 2,713 (2,701-2,732) |
 <!-- /speed-table -->
 
-The drafter does not slow prefill: the ~8% gap between the two T6 rows above is run-to-run spread. Back to back on one
-server, a cold 44K-token prompt prefilled at 2,008 tok/s with DFlash2 and 2,016 without.
+The drafter does not slow prefill: back to back on one server, a cold 44K-token prompt prefilled at 2,008 tok/s with
+DFlash2 and 2,016 without it.
 
 ## Limitations
 
