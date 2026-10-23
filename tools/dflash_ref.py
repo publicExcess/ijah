@@ -36,7 +36,7 @@ os.environ.setdefault("NE_FN_ROUND", "f32")
 refenv.add_paths()
 import numpy as np  # noqa: E402
 
-DRAFTER = Path(os.environ.get("NE_DFL_PATH", Path.home() / "Models/drafters/Qwen3.8-Flash-Next-DFlash2"))
+DRAFTER = Path(os.environ.get("NE_DFL_PATH", Path.home() / ".cache/ijah/drafters/Qwen3.8-Flash-Next-DFlash2"))
 LAYERS = (5, 15, 25, 35, 45)
 
 
