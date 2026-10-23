@@ -7,8 +7,8 @@
 Endpoints: POST /v1/chat/completions (stream and not), GET /v1/models, GET /health. Binds 127.0.0.1 only. Every
 /v1 request needs `Authorization: Bearer <key>` (the key file's content; compared in constant time; logs show only
 sha256(key)[:8]). One generation at a time: a single engine worker thread, requests queue in arrival order.
-($PY = .venv/bin/python -I -B, or $IJAH_PY; start / stop with tools/serve.sh, which also runs the RAM watchdog and,
-when IJAH_LOCK_SCRIPT is set, takes the machine lock.)
+($PY = .venv/bin/python -I -B, or $IJAH_PY; start / stop with tools/serve.sh or tools/ijah, which also run the RAM
+watchdog and, when IJAH_LOCK_SCRIPT is set, take the machine lock.)
 """
 import argparse
 import collections
@@ -32,7 +32,6 @@ ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(ROOT / "tools"))
 import refenv  # noqa: E402
-import ijah_paths  # noqa: E402
 
 refenv.add_paths()
 from tokenizers import Tokenizer  # noqa: E402
@@ -45,8 +44,10 @@ from prefix_cache import parse_bytes  # noqa: E402
 import prefix_cache as PC  # noqa: E402
 import grammar as G  # noqa: E402
 import vision as V  # noqa: E402
+# the layout (key file, cache dir, port, registry, packs, drafters): one module, shared with tools/ijah
+from serve_config import (CACHE_DIR, DRAFTER_FILES, DRAFTER_HINT, KEY_FILE, MODELS, PORT, canonical_id,  # noqa: E402,F401
+                          drafter_candidates, find_drafter, pack_complete, resolve_model)
 
-KEY_FILE = Path.home() / ".config/ijah/api-key"
 POLL_S = 0.25   # a request thread looks at its client socket (and its job) this often while no token arrives
 STALL_S = float(os.environ.get("NE_SRV_STALL_S", 900))   # a pass of the engine loop this long is a hang (0 = no check)
 MAX_BODY = int(float(os.environ.get("NE_SRV_MAX_BODY_MB", 64)) * (1 << 20))   # request bodies above this: 413
@@ -400,15 +401,17 @@ class App:
             sf = (lambda j: base_backs[j]) if share and base_backs else (lambda j: None)
             if a.mock:
                 backs = [B.MockBackend(tok, c, a.mock_delay, prefill_rate=a.mock_prefill_rate or None, mtp_depth=a.mtp,
-                                       name=mid if nm > 1 else None, share_state=sf(j)) for j, c in enumerate(slot_ctx)]
+                                       name=mid if nm > 1 else None, share_state=sf(j),
+                                       drafter=getattr(a, "drafters", {}).get(mid)) for j, c in enumerate(slot_ctx)]
             else:
                 # further models open their pack on the same engine: files they share with an open pack (same inode:
                 # Swift-1.5 shares the base's experts) are one mapping + one set of buffers (core/pack.mm)
+                dr = getattr(a, "drafters", {}).get(mid)   # lab-dflfix: this model id's drafter (or None)
                 backs = [B.RealBackend(ROOT, pack, a.ctx, a.mtp, Path(a.lib).resolve(), None, log, engine=first,
-                                       state_from=sf(0))]
+                                       state_from=sf(0), drafter=dr)]
                 for j, c in enumerate(slot_ctx[1:], 1):
                     backs.append(B.RealBackend(ROOT, pack, c, a.mtp, Path(a.lib).resolve(), None, log, share=backs[0],
-                                               state_from=sf(j)))
+                                               state_from=sf(j), drafter=dr))
                 first = first or backs[0]
             base_backs = base_backs or backs
             t_load += time.perf_counter() - t0
@@ -489,12 +492,30 @@ class App:
         if m is None:
             m = next((x for k, x in self.models.items() if k.lower() == str(name).lower()), None)
         if m is None:
+            # release (23 Oct): a -dflash id is an alias of its plain id with the DFlash2 drafter (server/models.json
+            # "alias_of"). Served by the plain model when that model loaded its drafter; otherwise a 400, so a request
+            # that asks for the drafter can never be answered by the MTP head alone (the 19 Oct trap, docs/server.md 13)
+            try:
+                reg = json.loads(MODELS.read_text())["models"]
+                k = next((k for k in reg if k.lower() == str(name).lower()), None)
+            except Exception:   # noqa: BLE001
+                reg, k = {}, None
+            base = reg[k].get("alias_of") if k else None
+            if base and base in self.models:
+                if (getattr(self.a, "drafters", None) or {}).get(base):
+                    return self.models[base]
+                raise chat.RequestError(f"model {name!r} needs its DFlash2 drafter, which this server did not load (it "
+                                        f"serves {base} with the MTP head only); get the drafter ({DRAFTER_HINT}) "
+                                        f"and restart, or ask for {base}")
             if getattr(self.a, "allow_any_model", False) and len(self.models) == 1:
                 if str(name) not in self._lenient_seen:
                     self._lenient_seen.add(str(name))
                     log(f"model {str(name)!r} is not served: --allow-any-model -> answering {self.default.id} "
                         f"(one warning per name)")
                 return self.default
+            if base:
+                raise chat.RequestError(f"model {name!r} (= {base} with the DFlash2 drafter) is not served; this server "
+                                        f"has {', '.join(self.models)}; start it with --model-id {base}")
             raise chat.RequestError(f"unknown model {name!r}; this server has {', '.join(self.models)}")
         return m
 
@@ -824,7 +845,9 @@ def make_handler(app):
                     "context_length": app.ctx, "max_model_len": app.ctx, "capabilities": app.capabilities(m),
                     "input_modalities": ["text", "image"] if app.vision else ["text"],
                     "reasoning_efforts": ["none", "low", "medium", "high", "xhigh"],
-                    "default_reasoning_effort": app.a.effort} for m in app.models.values()]})
+                    "default_reasoning_effort": app.a.effort,
+                    "drafter": "dflash2" if (getattr(app.a, "drafters", None) or {}).get(m.id) else "mtp"}
+                    for m in app.models.values()]})
             self._err(404, f"no route {self.command} {p}")
 
         def handle_expect_100(self):
@@ -1209,46 +1232,54 @@ def make_handler(app):
     return H
 
 
-MODELS = HERE / "models.json"
-
-
-def pack_complete(d):
-    """A pack directory is servable: config + index + tokenizer present, and a T6 pack (trunk6 metadata) has all its
-    layers converted plus the bf16 mixer (a partial T6 pack is a valid but mixed model: not served by id)."""
-    d = Path(d)
-    if not all((d / f).exists() for f in ("config.json", "model.safetensors.index.json", "tokenizer.json")):
-        return False
-    t6 = json.loads((d / "model.safetensors.index.json").read_text()).get("metadata", {}).get("trunk6")
-    if t6 is None:
-        return True
-    n = json.loads((d / "config.json").read_text()).get("text_config", {}).get("num_hidden_layers", 48)
-    return len(t6.get("layers", [])) == n and bool(t6.get("mixer_bf16"))
-
-
-def resolve_model(model_id, pack=None, registry=MODELS):
-    """(model id, pack dir, note). --pack wins (the id is then only the name reported); else the registry's first
-    complete pack for the id ('@IJAH_PACKS/' = the packs directory, IJAH_PACKS, default ~/.cache/ijah/packs); unknown
-    id without --pack -> SystemExit listing the known ids."""
+def drafter_spec(model_id, a=None, registry=MODELS, required=False):
+    """The model id's DFlash2 drafter (server/models.json "drafter": kind + candidate paths) -> dict(path, block, kmax,
+    bits, gate, max_ctx) with the first path holding config.json + model.safetensors (--drafter-path overrides), or
+    None = the MTP head drafts. release (23 Oct): DFlash2 is the default for the plain ids whose entry has a drafter
+    (--drafter auto, env NE_DRAFTER): present -> used; absent -> MTP with one log line saying how to get it.
+    --drafter none (or --mtp 0) -> None. Required (a -dflash alias id, or --drafter dflash2) and missing ->
+    SystemExit before any model loads."""
     reg = json.loads(Path(registry).read_text())
-    model_id = model_id or reg["default"]
-    if pack:
-        return model_id, str(Path(pack).expanduser()), "--pack"
-    if model_id not in reg["models"]:
-        raise SystemExit(f"unknown --model-id {model_id!r} (known: {', '.join(reg['models'])}; or pass --pack DIR)")
-    tried = []
-    for c in reg["models"][model_id]["packs"]:
-        d = str(ijah_paths.packs_dir() / c[len("@IJAH_PACKS/"):]) if c.startswith("@IJAH_PACKS/") else str(Path(c).expanduser())
-        if pack_complete(d):
-            return model_id, d, f"registry ({'first choice' if not tried else 'fallback; incomplete or missing: ' + ', '.join(tried)})"
-        tried.append(d)
-    hint = "".join(f"; download: hf download {ijah_paths.HF_ORG}/{Path(t).name} --local-dir {t}" for t in tried[:1])
-    raise SystemExit(f"--model-id {model_id}: no complete pack among {tried}{hint} (or pass --pack DIR)")
+    model_id, alias = canonical_id(model_id, registry)
+    required = required or alias
+    mode = getattr(a, "drafter", None) or "auto"
+    d = reg["models"].get(model_id, {}).get("drafter")
+    if not d:
+        if required:
+            raise SystemExit(f"{model_id} has no DFlash2 drafter (server/models.json)")
+        return None
+    if d.get("kind") != "dflash2":
+        raise SystemExit(f"{model_id}: unknown drafter kind {d.get('kind')!r}")
+    if mode == "none" or (a is not None and getattr(a, "mtp", 2) <= 0):
+        if required:
+            raise SystemExit(f"{model_id}: a -dflash id needs the drafter, but --drafter none / --mtp 0 turns it off")
+        return None
+    cands = drafter_candidates(model_id, getattr(a, "drafter_path", None), registry)
+    p = find_drafter(cands)
+    if p:
+        return dict(kind="dflash2", path=p, block=getattr(a, "dflash_block", 8), kmax=getattr(a, "dflash_kmax", 5),
+                    bits=getattr(a, "dflash_bits", 8), gate=getattr(a, "dflash_gate", 1),
+                    max_ctx=getattr(a, "dflash_max_ctx", 8192))
+    if required or mode == "dflash2":
+        raise SystemExit(f"{model_id} needs its DFlash2 drafter checkpoint ({' / '.join(DRAFTER_FILES)}) in one of: "
+                         f"{', '.join(cands)} (or --drafter-path DIR); get it with: {DRAFTER_HINT}")
+    log(f"model {model_id}: no DFlash2 drafter in {', '.join(cands)}: drafting with the MTP head only (about 7-15% "
+        f"slower at short context). Get the drafter with `ijah download drafter` or {DRAFTER_HINT}; "
+        f"--drafter none silences this")
+    return None
+
+
+def models_all(reg, with_drafters=False):
+    """--models all: the registry ids, default first, without the -dflash aliases (each plain id loads its drafter
+    when present) and the ids marked "in_all": false (the 4-bit pack: its own experts, nothing shared). with_drafters: accepted for old command lines; it changes nothing now."""
+    ids = [reg["default"]] + [m for m in reg["models"] if m != reg["default"]]
+    return [m for m in ids if not reg["models"][m].get("alias_of") and reg["models"][m].get("in_all", True)]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8140)
+    ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--pack", default=None, help="pack directory (default: the --model-id's pack in server/models.json)")
     ap.add_argument("--ctx", type=int, default=262144, help="context window = KV size (tmax); reply cap = this")
     ap.add_argument("--mtp", type=int, default=2, help="MTP draft depth (0 = off; > 2: greedy requests still draft 2 "
@@ -1266,7 +1297,7 @@ def main():
     ap.add_argument("--cache-ram", default="8GB", help="prefix cache RAM budget (parked KV rows + checkpoints)")
     ap.add_argument("--cache-disk", default="0", help="prefix cache SSD budget (e.g. 20GB; on = 20GB; 0 = off); "
                     "the SSD tier persists across restarts")
-    ap.add_argument("--cache-dir", default=str(Path.home() / ".cache/ijah/prefix-cache"),
+    ap.add_argument("--cache-dir", default=str(CACHE_DIR),
                     help="SSD tier directory (kept across restarts; entries keyed by build + pack + model)")
     ap.add_argument("--key-file", default=str(KEY_FILE))
     ap.add_argument("--model-id", default=None, help="model id reported and, without --pack, looked up in "
@@ -1292,36 +1323,56 @@ def main():
     ap.add_argument("--prefill-int8", action="store_true", help="opt-in: int8 activations for the T6 trunk Linears in "
                     "prefill (in >= 1024; NE_T6_A8=128): ~+3-4%% cold prefill, KLD A n.s. / B +2%% (CI touches 0) / C "
                     "better (docs/prefill.md 4f); off by default to keep quality")
-    ap.add_argument("--drafter", default="mtp", choices=["mtp", "dflash2"], help="lab-dflash: dflash2 = the DFlash2 "
-                    "block drafter drafts MTP rounds (its q-gated verify picks 1 .. kmax drafts; the MTP head when its "
-                    "context is short; docs/mtp.md 13). Default mtp (the native head)")
-    ap.add_argument("--drafter-path", default=str(Path.home() / "Models/drafters/Qwen3.8-Flash-Next-DFlash2"),
-                    help="the DFlash2 checkpoint (config.json + model.safetensors)")
-    ap.add_argument("--dflash-kmax", type=int, default=5, help="most drafts a DFlash2 round verifies (<= 5 in this build: verify runs at kmax + 1 rows and the kernels are instantiated to 6; kmax 6-7 is built and measured in development only)")
+    # DFlash2 block drafter (docs/mtp.md 13), per model id (server/models.json "drafter"). release (23 Oct): on by
+    # default for the plain ids when its checkpoint is present (exact gate, --dflash-max-ctx 8192); absent -> the MTP
+    # head drafts (one log line). The -dflash ids are aliases that require it.
+    ap.add_argument("--drafter", default=os.environ.get("NE_DRAFTER") or "auto", choices=["auto", "dflash2", "none", "mtp"],
+                    help="auto (default): DFlash2 when its checkpoint is present, else the MTP head; dflash2: required "
+                    "(refuse to start without it); none (= mtp, the name before 23 Oct): the MTP head only (env NE_DRAFTER)")
+    ap.add_argument("--drafter-path", default=None, help="DFlash2 checkpoint dir (config.json + model.safetensors) for "
+                    "the served ids that have a drafter (default: the registry's paths, ~/.cache/ijah/drafters/...)")
+    ap.add_argument("--with-drafters", action="store_true", help=argparse.SUPPRESS)   # (before 23 Oct; now a no-op)
+    ap.add_argument("--dflash-block", type=int, default=8, choices=range(2, 9), metavar="2..8",
+                    help="DFlash2 block rows (8 = trained)")
+    ap.add_argument("--dflash-gate", type=int, default=1, choices=[0, 1, 2], help="1: the exact sequential q-gate; 2: "
+                    "lookahead over path-free confidences (docs/mtp.md 13.10); 0: kmax drafts")
+    ap.add_argument("--dflash-max-ctx", type=int, default=8192, help="no block drafts past this many context tokens (the "
+                    "MTP head drafts there: 8K / 32K measured parity, docs/mtp.md 13.9)")
+    ap.add_argument("--dflash-kmax", type=int, default=5, choices=range(1, 6), metavar="1..5", help="most drafts a DFlash2 round verifies (<= 5 in this build: verify runs at kmax + 1 rows and the kernels are instantiated to 6; kmax 6-7 is built and measured in development only)")
     ap.add_argument("--dflash-bits", type=int, default=8, choices=[8, 4], help="drafter weight bits")
     ap.add_argument("--mock", action="store_true", help="CPU mock engine (tests)")
     ap.add_argument("--mock-delay", type=float, default=0.0, help="mock seconds per token")
     ap.add_argument("--mock-prefill-rate", type=float, default=0.0, help="mock prefill tokens per second (0 = instant)")
     a = ap.parse_args()
-    if a.drafter != "mtp":  # lab-dflash: RealBackend reads these when it creates the MTP loop
-        os.environ.update(NE_DRAFTER=a.drafter, NE_DRAFTER_PATH=a.drafter_path, NE_DFL_KMAX=str(a.dflash_kmax),
-                          NE_DFL_BITS=str(a.dflash_bits))
+    a.drafter = "none" if a.drafter == "mtp" else a.drafter
     if a.prefill_int8:   # read by the engine library (kernels/trunk6) when the model loads, so set before loading
         os.environ.setdefault("NE_T6_A8", "128")
     if os.environ.get("NE_T6_A8", "0") not in ("", "0"):
         log(f"prefill int8 trunk activations ON (NE_T6_A8={os.environ['NE_T6_A8']})")
     if a.list_models:
-        for mid in json.loads(MODELS.read_text())["models"]:
+        reg = json.loads(MODELS.read_text())["models"]
+        for mid in reg:
+            if reg[mid].get("alias_of"):
+                print(f"{mid}: alias of {reg[mid]['alias_of']} with its DFlash2 drafter required")
+                continue
             try:
-                print(f"{mid}: {resolve_model(mid)[1]}  [{resolve_model(mid)[2]}]")
+                _, pk, how = resolve_model(mid)
+                print(f"{mid}: {pk}  [{how}]")
             except SystemExit as e:
                 print(f"{mid}: {e}")
+            d = reg[mid].get("drafter")
+            if d:
+                hit = find_drafter(drafter_candidates(mid, a.drafter_path))
+                print(f"    drafter: " + (f"DFlash2 {hit}" + (" (off: --drafter none)" if a.drafter == "none" else "")
+                                          if hit else f"none found (MTP head; get it: {DRAFTER_HINT})"))
         return
     if a.models:
         if a.models != "all":
             raise SystemExit("--models takes 'all' (or use --model-id ID1,ID2)")
         reg = json.loads(MODELS.read_text())
-        ids = [reg["default"]] + [m for m in reg["models"] if m != reg["default"]]
+        if a.with_drafters:
+            log("--with-drafters is no longer needed: every model id uses its DFlash2 drafter when present")
+        ids = models_all(reg)
         ok = []
         for mid in ids:
             try:
@@ -1333,13 +1384,18 @@ def main():
     ids = [x.strip() for x in (a.model_id or "").split(",") if x.strip()] or [None]
     if len(ids) > 1 and a.pack:
         raise SystemExit("--pack serves one model; with several --model-id ids every id needs a registry pack")
-    if len(set(ids)) != len(ids):
-        raise SystemExit(f"--model-id lists an id twice: {a.model_id}")
+    want = [canonical_id(m) for m in ids]   # a -dflash alias -> (its plain id, drafter required)
+    if len({m for m, _ in want}) != len(want):
+        raise SystemExit(f"--model-id lists an id twice (a -dflash id is its plain id with the drafter): {a.model_id}")
     a.served = []
-    for mid in ids:
+    for (mid, need_dr), asked in zip(want, ids):
         mid, pack, how = resolve_model(mid, a.pack)
-        log(f"model {mid}: pack {pack} ({how})")
+        dr = drafter_spec(mid, a, required=need_dr)  # (checked here, before any model loads)
+        log(f"model {mid}: pack {pack} ({how})" + (f", DFlash2 drafter {dr['path']} (gate {dr['gate']}, block drafts "
+            f"up to {dr['max_ctx']} context tokens)" if dr else ", MTP head") + (f" (asked as {asked})" if need_dr else ""))
         a.served.append((mid, pack))
+        a.drafters = getattr(a, "drafters", {})
+        a.drafters[mid] = dr
     a.model_id, a.pack = a.served[0]
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         raise SystemExit("bind to loopback only")

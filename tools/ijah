@@ -1,0 +1,355 @@
+#!/usr/bin/env python3
+"""ijah: install and run Ijah (stdlib only; reads the server's own layout from server/serve_config.py).
+
+  ijah serve start [MODEL|all] [-- server args]    start the server (tools/serve.sh), wait for /health
+  ijah serve stop | status | log [N] | restart     restart = stop, then start with the last start's arguments
+  ijah serve run [MODEL|all] [-- server args]      in the foreground (brew services / launchd)
+  ijah download base|swift|base-4bit|drafter|ngram|all [--dry-run] [--force]
+  ijah link                                        hard-link the files the packs share (n-gram table, experts)
+  ijah models                                      model ids, their packs and drafters (and what is being served)
+  ijah doctor                                      check this Mac, the build, the packs, the key and the port
+
+MODEL: a model id (ijah models), default Qwen3.8-Flash-Next-native; `all` = the base and Swift-1.5 in one process.
+Downloads go to ~/.cache/ijah (IJAH_PACKS, IJAH_DRAFTERS); every revision is pinned.
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(os.environ.get("IJAH_ROOT") or Path(__file__).resolve().parent.parent)
+sys.path.insert(0, str(ROOT / "server"))
+import serve_config as C  # noqa: E402
+
+SERVE = ROOT / "tools/serve.sh"
+LAST = C.RUN_DIR / "ijah-last-start.json"
+
+
+def die(msg, rc=1):
+    print(f"ijah: {msg}", file=sys.stderr)
+    sys.exit(rc)
+
+
+def python():
+    for p in (os.environ.get("IJAH_PY"), ROOT / ".venv/bin/python"):
+        if p and Path(p).exists():
+            return str(p)
+    return None
+
+
+def hf_cli():
+    py = python()
+    for p in (shutil.which("hf"), py and Path(py).parent / "hf"):
+        if p and Path(p).exists():
+            return str(p)
+    return None
+
+
+def listening(port=C.PORT):
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def get(path, key=False, timeout=3):
+    req = urllib.request.Request(f"http://127.0.0.1:{C.PORT}{path}")
+    if key:
+        req.add_header("Authorization", "Bearer " + C.KEY_FILE.read_text().strip())
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def gb(n):
+    return f"{n / 1e9:.0f} GB" if n >= 1e10 else f"{n / 1e9:.1f} GB"
+
+
+# ------------------------------------------------------------------------------------------------ serve
+def serve(args):
+    if not args:
+        die("usage: ijah serve start [MODEL|all] [-- args] | run [MODEL|all] [-- args] | stop | status | log [N] | restart", 64)
+    cmd, rest = args[0], args[1:]
+    env = dict(os.environ)
+    if cmd == "restart":
+        run_serve(["stop"], env)
+        last = json.loads(LAST.read_text()) if LAST.exists() else {}
+        cmd, rest = "start", rest or last.get("args", [])
+    if cmd in ("start", "run"):
+        if rest and rest[0] != "--":
+            env["NE_MODEL"] = rest[0]
+            rest = rest[1:]
+        if cmd == "run":
+            return run_serve(["run"] + rest, env)
+        C.RUN_DIR.mkdir(parents=True, exist_ok=True)
+        model = [env["NE_MODEL"]] if env.get("NE_MODEL") else []
+        LAST.write_text(json.dumps({"args": model + rest}))
+        return run_serve(["start"] + rest, env)
+    if cmd in ("stop", "status", "state"):
+        return run_serve([cmd], env)
+    if cmd == "log":
+        return run_serve(["log", rest[0] if rest else "40"], env)
+    die(f"unknown serve command {cmd!r}", 64)
+
+
+def run_serve(argv, env):
+    if not SERVE.exists():
+        die(f"no {SERVE}")
+    return subprocess.call(["/bin/zsh", str(SERVE)] + argv, env=env)
+
+
+# ------------------------------------------------------------------------------------------------ download
+def pack_dirs():
+    return [C.DOWNLOADS[n]["dest"] for n in C.PACK_DOWNLOADS]
+
+
+def ngram_home():
+    """where the one real copy of the n-gram table lives (or goes): a pack folder that has it, else the first pack
+    folder that exists, else the base pack's folder"""
+    have = [d for d in pack_dirs() if (d / C.NGRAM_FILE).is_file()]
+    return (have or [d for d in pack_dirs() if d.is_dir()] or [pack_dirs()[0]])[0]
+
+
+def link_ngram(quiet=False):
+    src = ngram_home() / C.NGRAM_FILE
+    if not src.is_file():
+        if not quiet:
+            print(f"n-gram table: not downloaded yet (ijah download ngram, {C.DOWNLOADS['ngram']['gb']} GB)")
+        return
+    for d in pack_dirs():
+        dst = d / C.NGRAM_FILE
+        if not d.is_dir() or d == src.parent:
+            continue
+        if dst.exists():
+            if os.path.samefile(src, dst):
+                continue
+            print(f"n-gram table: {dst} is a separate copy (delete it and run `ijah link` to save "
+                  f"{gb(dst.stat().st_size)})")
+            continue
+        try:
+            os.link(src, dst)
+            print(f"n-gram table: linked into {d.name}")
+        except OSError as e:
+            print(f"n-gram table: cannot hard-link into {d} ({e.strerror}); keep the packs on one volume")
+
+
+def free_bytes(p):
+    p = Path(p)
+    while not p.exists():
+        p = p.parent
+    return shutil.disk_usage(p).free
+
+
+def du(p):
+    p = Path(p)
+    return sum(f.stat().st_size for f in p.rglob("*") if f.is_file() and not f.is_symlink()) if p.is_dir() else 0
+
+
+def download(args):
+    flags = {a for a in args if a.startswith("--")}
+    names = [a for a in args if not a.startswith("--")]
+    if not names or "--help" in flags:
+        print("usage: ijah download NAME... [--dry-run] [--force]\n")
+        for n, d in C.DOWNLOADS.items():
+            print(f"  {n:<10} {d['gb']:>5} GB  {d['what']}")
+        print("  all              everything above")
+        return 0 if names or "--help" in flags else 64
+    if "all" in names:
+        names = list(C.DOWNLOADS)
+    bad = [n for n in names if n not in C.DOWNLOADS]
+    if bad:
+        die(f"unknown download {', '.join(bad)} (choose from {', '.join(C.DOWNLOADS)}, all)", 64)
+    names = sorted(set(names), key=list(C.DOWNLOADS).index)
+    if "ngram" in names:   # the table goes into a pack folder: fetch the packs first
+        names = [n for n in names if n != "ngram"] + ["ngram"]
+    hf = hf_cli()
+    if not hf and "--dry-run" not in flags:
+        die("no `hf` command (Hugging Face CLI): `make venv` installs it into .venv, or: pip install -U huggingface_hub")
+    rc = 0
+    for n in names:
+        d = C.DOWNLOADS[n]
+        dest = ngram_home() if n == "ngram" else d["dest"]
+        files = d.get("files", [])
+        have = (dest / C.NGRAM_FILE).stat().st_size if n == "ngram" and (dest / C.NGRAM_FILE).exists() else \
+            (du(dest) if n != "ngram" else 0)
+        need = max(0, d["gb"] * 1e9 - have)
+        cmd = [hf or "hf", "download", d["repo"], *files, "--revision", d["rev"], "--local-dir", str(dest)]
+        print(f"== {n}: {d['what']}, ~{d['gb']} GB -> {dest}")
+        if "--dry-run" in flags:
+            print("   " + " ".join(cmd))
+            continue
+        free = free_bytes(dest)
+        if need > free * 0.98 and "--force" not in flags:
+            print(f"   not enough disk: ~{gb(need)} still to fetch, {gb(free)} free (--force to try anyway)")
+            rc = 1
+            continue
+        dest.mkdir(parents=True, exist_ok=True)
+        r = subprocess.call(cmd)
+        if r:
+            print(f"   hf download failed (exit {r}); run the same command again to resume")
+            rc = r
+            continue
+    if any(n in C.PACK_DOWNLOADS or n == "ngram" for n in names) and "--dry-run" not in flags:
+        link_ngram()
+    if "--dry-run" not in flags and rc == 0:
+        print("done. Next: ijah doctor, then ijah serve start")
+    return rc
+
+
+# ------------------------------------------------------------------------------------------------ link
+def link(args):
+    link_ngram()
+    try:
+        a = C.resolve_model("Qwen3.8-Flash-Next-native")[1]
+        b = C.resolve_model("Swift-1.5-Flash-Next-native")[1]
+    except SystemExit:
+        print("experts: the base and Swift-1.5 packs are not both present; nothing else to link")
+        return 0
+    py = python() or sys.executable
+    print(f"experts: comparing {Path(a).name} and {Path(b).name} (reads both packs once)")
+    return subprocess.call([py, str(ROOT / "tools/link_shared_packs.py"), a, b] + args)
+
+
+# ------------------------------------------------------------------------------------------------ models
+def entries():
+    reg = C.load_registry()
+    return reg, {m: e for m, e in reg["models"].items() if not e.get("alias_of")}
+
+
+def hint_for(mid):
+    n = next((n for n, d in C.DOWNLOADS.items() if d.get("model_id") == mid), None)
+    return f"ijah download {n}" if n else "see server/models.json"
+
+
+def models(args):
+    reg, plain = entries()
+    for mid, e in plain.items():
+        try:
+            _, pack, _ = C.resolve_model(mid)
+            ng = "" if (Path(pack) / C.NGRAM_FILE).exists() else f"  (no {C.NGRAM_FILE}: ijah download ngram)"
+            where = pack + ng
+        except SystemExit:
+            where = f"not downloaded ({hint_for(mid)})"
+        dr = C.find_drafter(C.drafter_candidates(mid))
+        tag = " [default]" if mid == reg["default"] else ""
+        print(f"{mid}{tag}\n    pack:    {where}\n    drafter: "
+              + (f"DFlash2 ({dr})" if dr else ("MTP head only (ijah download drafter)" if e.get("drafter") else "MTP head")))
+    al = [m for m, e in reg["models"].items() if e.get("alias_of")]
+    if al:
+        print(f"aliases (need the drafter): {', '.join(al)}")
+    if listening():
+        try:
+            served = get("/v1/models", key=True)["data"]
+            print(f"serving on 127.0.0.1:{C.PORT}: " + ", ".join(f"{m['id']} ({m.get('drafter', '?')})" for m in served))
+        except Exception as e:   # noqa: BLE001
+            print(f"port {C.PORT} is in use; /v1/models: {e}")
+    else:
+        print(f"not serving (port {C.PORT}); start with: ijah serve start [MODEL]")
+    return 0
+
+
+# ------------------------------------------------------------------------------------------------ doctor
+def sh(*cmd):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+
+
+def doctor(args):
+    res = []
+
+    def out(level, what, msg):
+        res.append(level)
+        print(f"{level:<4} {what:<10} {msg}")
+
+    _, chip = sh("sysctl", "-n", "machdep.cpu.brand_string")
+    out("ok" if "M5" in chip.split() else "FAIL", "gpu", chip + ("" if "M5" in chip.split() else
+        ": Ijah needs an Apple M5 GPU (Metal 4 tensor units); M1-M4 do not work"))
+    _, ver = sh("sw_vers", "-productVersion")
+    major = int(ver.split(".")[0]) if ver.split(".")[0].isdigit() else 0
+    out("ok" if major >= 27 else "FAIL", "macos", ver + ("" if major >= 27 else ": Ijah needs macOS 27"))
+    rc, mv = sh("xcrun", "-sdk", "macosx", "metal", "--version")
+    if rc:
+        rc, mv = sh("xcodebuild", "-showComponent", "MetalToolchain")
+        rc = 0 if "installed" in mv.lower() and "not installed" not in mv.lower() else 1
+    out("ok" if rc == 0 else "FAIL", "metal", (mv.splitlines() or ["?"])[0] if rc == 0 else
+        "no Metal toolchain: xcode-select --install, then xcodebuild -downloadComponent MetalToolchain")
+    lib, ml = ROOT / "build/libengine.dylib", ROOT / "build/engine.metallib"
+    out("ok" if lib.exists() and ml.exists() else "FAIL", "build",
+        f"{lib.parent}" if lib.exists() and ml.exists() else f"no {lib.name} / {ml.name}: run make in {ROOT}")
+    py = python()
+    if py:
+        rc, msg = sh(py, "-I", "-c", "import tokenizers, jinja2, numpy, xgrammar")
+        out("ok" if rc == 0 else "FAIL", "python", py if rc == 0 else f"{py}: {msg.splitlines()[-1]} (make venv)")
+    else:
+        out("FAIL", "python", "no .venv (make venv) and no IJAH_PY")
+    out("ok" if hf_cli() else "warn", "hf", hf_cli() or "no `hf` CLI: downloads need it (make venv)")
+    _, mem = sh("sysctl", "-n", "hw.memsize")
+    total = int(mem) if mem.isdigit() else 0
+    rc, vm = sh("vm_stat")
+    page = 16384
+    pages = {}
+    for line in vm.splitlines():
+        if "page size of" in line:
+            page = int(line.split("page size of")[1].split()[0])
+        elif ":" in line:
+            k, v = line.split(":", 1)
+            v = v.strip().rstrip(".")
+            if v.isdigit():
+                pages[k.strip()] = int(v)
+    avail = page * sum(pages.get(k, 0) for k in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"))
+    up = listening()
+    lvl = "ok" if avail >= 90e9 or up else "warn"
+    out(lvl, "memory", f"{gb(avail)} available of {gb(total)}; one model at the full 262K context needs ~90 GB"
+        + (" (the server is running and holds its share)" if up else ""))
+    free = free_bytes(C.PACKS_DIR)
+    out("ok", "disk", f"{gb(free)} free for {C.PACKS_DIR} (base + n-gram table: ~185 GB)")
+    reg, plain = entries()
+    for mid in plain:
+        try:
+            _, pack, _ = C.resolve_model(mid)
+            ng = (Path(pack) / C.NGRAM_FILE).exists()
+            out("ok" if ng else "FAIL", "pack", f"{mid}: {pack}" + ("" if ng else f" has no {C.NGRAM_FILE} (ijah download ngram)"))
+        except SystemExit:
+            out("FAIL" if mid == reg["default"] else "info", "pack", f"{mid}: not downloaded ({hint_for(mid)})")
+    dr = C.find_drafter(C.drafter_candidates(reg["default"]))
+    out("ok" if dr else "warn", "drafter", dr or "not downloaded: the MTP head drafts, ~7-15% slower at short context "
+        "(ijah download drafter)")
+    k = C.KEY_FILE
+    if k.exists():
+        ok = not (k.stat().st_mode & 0o077)
+        out("ok" if ok else "FAIL", "key", f"{k}" + ("" if ok else ": must be chmod 600"))
+    else:
+        out("info", "key", f"{k}: made on the first `ijah serve start`")
+    if up:
+        try:
+            h = get("/health")
+            out("ok", "port", f"{C.PORT}: Ijah is serving ({h.get('status')})")
+        except Exception:   # noqa: BLE001
+            out("FAIL", "port", f"{C.PORT} is taken by another program (NE_SERVE_PORT=... picks another)")
+    else:
+        out("ok", "port", f"{C.PORT} is free")
+    bad = res.count("FAIL")
+    print(f"\n{bad} problem(s)" if bad else "\nall good")
+    return 1 if bad else 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    fn = {"serve": serve, "download": download, "link": link, "models": models, "doctor": doctor}.get(cmd)
+    if fn is None:
+        die(f"unknown command {cmd!r} (ijah --help)", 64)
+    return fn(rest) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

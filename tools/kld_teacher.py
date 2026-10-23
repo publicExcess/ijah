@@ -109,6 +109,38 @@ class SelfTest:
         pass
 
 
+class DumpedLogits:
+    """lab splashcmp: stands in for FnModel with another engine's logits, dumped per window as raw f32 [T][V]
+    (tools/gguf_logits.cpp: a GGUF through llama.cpp, teacher-forced over the same windows): DIR/{set}-{window}.f32"""
+
+    def __init__(self, d, W, blk):
+        import numpy as np
+        self.np, self.d, self.W, self.blk = np, Path(d), W, blk
+        self.window, self.p, self.key, self.mm = None, 0, None, None
+
+    def reset(self):
+        self.p = 0
+
+    def feed(self, tok, row):
+        S, off = self.window
+        key = (S, self.W[S]["offsets"].index(off))
+        if key != self.key:
+            f = self.d / f"{key[0]}-{key[1]}.f32"
+            T = len(self.W[S]["windows"][key[1]])
+            self.mm = self.np.memmap(f, self.np.float32, "r")
+            assert self.mm.size % T == 0, (f, self.mm.size, T)
+            self.mm = self.mm.reshape(T, -1)
+            self.key = key
+        V = self.blk.shape[1]
+        assert self.mm.shape[1] >= V, (self.mm.shape, V)
+        self.blk[row] = self.mm[self.p, :V]
+        self.p += 1
+        return 0.0
+
+    def free(self):
+        self.mm = None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--name")
@@ -129,7 +161,21 @@ def main():
     ap.add_argument("--report", nargs="+")
     ap.add_argument("--selftest", action="store_true", help="CPU only, no engine: feed the teacher's own logits "
                     "through the scoring (KLD must be 0, NLL = the teacher's NLL in whole_kld.py's json)")
+    ap.add_argument("--logits-dir", default="", help="lab splashcmp: score dumped logits (DIR/{set}-{window}.f32, "
+                    "tools/gguf_logits.cpp) instead of the engine; --dump-tokens DIR first writes the windows' tokens")
+    ap.add_argument("--dump-tokens", default="", help="write DIR/{set}-{window}.tok (int32) for --sets and exit")
     a = ap.parse_args()
+    if a.dump_tokens:
+        import numpy as np
+        sys.path.insert(0, str(KLDCORE))
+        import kld_core as K
+        W = K.windows(Path(a.run))
+        Path(a.dump_tokens).mkdir(parents=True, exist_ok=True)
+        for S in a.sets.split(","):
+            for wi, w in enumerate(W[S]["windows"]):
+                np.asarray(w, np.int32).tofile(Path(a.dump_tokens) / f"{S}-{wi}.tok")
+            print(S, len(W[S]["windows"]), "windows,", sum(map(len, W[S]["windows"])), "tokens")
+        return
     if a.report:
         return report(a.report)
     # env before the library loads (layer graph + lab-attn's QSA read them at record time)
@@ -162,6 +208,8 @@ def main():
     blk = np.empty((SUB, V), np.float32)
     if a.selftest:
         m = SelfTest(head, run, W, blk)
+    elif a.logits_dir:
+        m = DumpedLogits(a.logits_dir, W, blk)
     else:
         eng = E.Engine()
         eng.set_ref_rounding(a.round == "ref")
@@ -173,7 +221,7 @@ def main():
     nx, am, lp_, ms = C.c_int(-1), C.c_int(-1), C.c_float(0), C.c_double(0)
 
     def feed(tok, row):
-        if a.selftest:
+        if a.selftest or a.logits_dir:
             return m.feed(tok, row)
         if eng.lib.ne_fn_model_step(m.ptr, int(tok), 1, blk[row].ctypes.data, C.byref(nx), C.byref(lp_), C.byref(am),
                                     C.byref(ms)) != 0:

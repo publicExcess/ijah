@@ -193,7 +193,7 @@ bool t6_record_stage(Recorder &r, Stage stage, const LayerW &w, GdnState &st, Sc
       const Tensor &d = m.router;  // dummy for the unused q8 shared-expert bindings
       r.dispatch(pso("fn_moe_router_r" + std::to_string(R)),
                  {s.xm, m.router, m.sgate, d, d, d, d, d, d, s.logits, s.gush, s.route, s.ctr1, s.uq,
-                  Arg::value((uint32_t)(moe_split(R, w) ? 1 : 0))},
+                  Arg::value(moe_lists(R, w) | (uint32_t)g_moe_spread << 8)},
                  sz((NE + 1 + 7) / 8), sz(256));
       t6_linears(r, R, s, {&m.sg, &m.su}, {s.xm, s.xm}, {b.graw, b.uraw2});
       if (g_t6_fuse && g_t6_fuse2 && simd_path(m.sd, R)) return true;  // SwiGLU in the shared down's prep (MoeGateUp)
@@ -207,7 +207,9 @@ bool t6_record_stage(Recorder &r, Stage stage, const LayerW &w, GdnState &st, Sc
       const std::string k = "_k" + std::to_string(m.gate.k) + "_r" + std::to_string(R);
       const Tensor &d = m.router;
       const int nxt = R * TOPK * 2 * (40 / 2);
-      if (moe_split(R, w)) {  // lab-verify: singles and multis concurrently (no barrier between)
+      if (moe_group(R, w)) {  // lab-moegroup: expert tiles of 1 / 2 / 4 rows concurrently (no barrier between)
+        record_moe_group(r, stage, w, s, h_out);
+      } else if (moe_split(R, w)) {  // lab-verify: singles and multis concurrently (no barrier between)
         r.dispatch(pso("fn_moe_gateup_s" + k), {s.xm, m.gate.t, m.up.t, m.gate.suh, m.up.suh, s.route, s.guo, s.gush,
                                                 d, d, d, s.sho, s.uq},
                    sz(nxt), sz(256));

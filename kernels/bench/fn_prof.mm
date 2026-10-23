@@ -80,6 +80,9 @@ int main(int argc, char **argv) {
   }
   // lab-verify: NE_PROF_ROWS=R profiles the R-row step (the MTP verify shape; random distinct rows -> ~disjoint routing)
   const int PR = getenv("NE_PROF_ROWS") ? std::max(1, atoi(getenv("NE_PROF_ROWS"))) : 1;
+  // lab-moegroup: NE_PROF_SPREAD=p: p % of rows 1.. R-1's routed slots moved to other experts (fn_moe_router), so the
+  // synthetic rows (which route much alike) share experts like real verify rows (docs/mtp.md 12.2); 0 = as routed
+  g_moe_spread = getenv("NE_PROF_SPREAD") ? std::clamp(atoi(getenv("NE_PROF_SPREAD")), 0, 100) : 0;
   try {
     auto pack = Pack::open(argv[1]);
     struct {
@@ -127,6 +130,12 @@ int main(int argc, char **argv) {
       float *h0 = (float *)m.h[0].host();
       uint32_t x = 12345;
       for (int i = 0; i < PR * HCD; i++) { x = x * 1664525u + 1013904223u; h0[i] = ((x >> 8) / 16777216.0f - 0.5f) * 0.1f; }
+      // lab-moegroup: NE_PROF_CORR=a: row r > 0 = (1 - a) row 0 + a (its random row) -> consecutive-token-like expert
+      // sharing (a = 1: the old independent rows); the step's distinct experts are printed below
+      const char *ce = getenv("NE_PROF_CORR");
+      const float a = ce ? (float)atof(ce) : 1.0f;
+      for (int r = 1; r < PR; r++)
+        for (int i = 0; i < HCD; i++) h0[r * HCD + i] = (1.0f - a) * h0[i] + a * h0[r * HCD + i];
     }
     ((uint32_t *)m.pos.host())[0] = (uint32_t)T;
     // the loaded tensors resident on the MTL4 queue (each recorder's own set then only adds references)
@@ -242,12 +251,19 @@ int main(int argc, char **argv) {
       f = c == std::string::npos ? "" : f.substr(c + 1);
     }
     const bool fuse2_def = g_t6_fuse2;
-    const int x_def = g_t6_x;
+    const int x_def = g_t6_x, group_def = g_moe_group, dd_def = g_moe_dedupe;
+    const bool ind_def = g_moe_group_ind;
     auto set_abenv = [&](bool on) {
       g_t6_fuse2 = fuse2_def;
       g_t6_x = x_def;
+      g_moe_group = group_def;  // lab-moegroup: GROUP=N (g_moe_group), IND=0/1 (g_moe_group_ind), DEDUPE=N
+      g_moe_group_ind = ind_def;
+      g_moe_dedupe = dd_def;
       for (auto &kv : abkv) {
-        if (kv.first == "FUSE2") { if (on) g_t6_fuse2 = atoi(kv.second.c_str()) != 0; }
+        if (kv.first == "GROUP") { if (on) g_moe_group = atoi(kv.second.c_str()); }
+        else if (kv.first == "IND") { if (on) g_moe_group_ind = atoi(kv.second.c_str()) != 0; }
+        else if (kv.first == "DEDUPE") { if (on) g_moe_dedupe = atoi(kv.second.c_str()); }
+        else if (kv.first == "FUSE2") { if (on) g_t6_fuse2 = atoi(kv.second.c_str()) != 0; }
         else if (kv.first == "X") { if (on) g_t6_x = (int)strtol(kv.second.c_str(), nullptr, 0); }
         else if (on) setenv(kv.first.c_str(), kv.second.c_str(), 1);
         else unsetenv(kv.first.c_str());
@@ -361,13 +377,18 @@ int main(int argc, char **argv) {
       memcpy(m.h[0].host(), hsave.data(), HCD * 4);
     }
     if (getenv("NE_PROF_DDCHECK")) {  // lab-verify: routed-expert dedupe vs per (row, slot): outputs after n layers
-      const int dd0 = g_moe_dedupe;
+      const int dd0 = g_moe_dedupe, gr0 = g_moe_group;
       const bool spl = std::string(getenv("NE_PROF_DDCHECK")) == "split", sp0 = g_moe_split;  // per pair vs split
+      const std::string ddm = getenv("NE_PROF_DDCHECK");
+      // lab-moegroup: group = per pair vs grouped; self / gself = per pair / grouped twice (run-to-run determinism)
+      const bool grp = ddm == "group" || ddm == "self" || ddm == "gself";
       std::vector<float> h0((float *)m.h[0].host(), (float *)m.h[0].host() + (size_t)PR * HCD);
       for (int n : {1, 4, 48}) {
         std::vector<float> o[2];
         for (int k = 0; k < 2; k++) {
-          if (spl) { g_moe_dedupe = 0; g_moe_split = k == 1; } else g_moe_dedupe = k == 1 ? 8 : 0;
+          g_moe_group = 0;
+          if (grp) { g_moe_dedupe = 0; g_moe_split = false; g_moe_group = (ddm == "group" ? k == 1 : ddm == "gself") ? 2 : 0; }
+          else if (spl) { g_moe_dedupe = 0; g_moe_split = k == 1; } else g_moe_dedupe = k == 1 ? 8 : 0;
           for (auto &st : m.st) {
             if (st.conv.buf) memset(st.conv.host(), 0, st.conv.nbytes());
             if (st.ssm.buf) memset(st.ssm.host(), 0, st.ssm.nbytes());
@@ -398,7 +419,35 @@ int main(int argc, char **argv) {
         }
         printf("ddcheck rows %d, %d layers: %zu of %zu bit-identical, max |diff| %.3g (max |h| %.3g)\n", PR, n, same,
                o[0].size(), md, mx);
+        if (PR > 1) {  // the last layer's routing: distinct experts, tiles (grouped run)
+          const uint32_t *uq = (const uint32_t *)s.uq.host();
+          const uint32_t *G = uq + 1 + PR * TOPK * (2 + PR) + 2 + 2 * PR * TOPK;
+          printf("  last layer: %u distinct experts of %d; tiles of 1 / 2 / 4 rows: %u / %u / %u\n", uq[0], PR * TOPK,
+                 G[0], G[1], G[2]);
+          if (grp) {  // every (row, slot) pair in exactly one tile, a tile's pairs on one expert
+            const uint32_t *rt = (const uint32_t *)s.route.host();
+            std::vector<int> seen(PR * TOPK, 0);
+            int bad = 0;
+            const int Ms[3] = {1, 2, 4};
+            for (int c = 0; c < 3; c++)
+              for (uint32_t t = 0; t < G[c]; t++) {
+                const uint32_t *te = G + 4 + c * PR * TOPK + t * Ms[c];
+                for (int j = 0; j < Ms[c]; j++) {
+                  if (te[j] == 0xFFFFFFFFu) { bad += c != 2 || j != 3; continue; }
+                  if (te[j] >= (uint32_t)(PR * TOPK)) { bad++; continue; }
+                  seen[te[j]]++;
+                  bad += (rt[(te[j] / TOPK) * 20 + te[j] % TOPK] & 511) != (rt[(te[0] / TOPK) * 20 + te[0] % TOPK] & 511);
+                }
+              }
+            for (int v : seen) bad += v != 1;
+            for (int r = 0; r < PR; r++)  // a row's experts distinct (the spread keeps them so)
+              for (int a = 0; a < TOPK; a++)
+                for (int b2 = a + 1; b2 < TOPK; b2++) bad += (rt[r * 20 + a] & 511) == (rt[r * 20 + b2] & 511);
+            printf("  tile lists: %s (%d problems)\n", bad ? "BAD" : "ok", bad);
+          }
+        }
       }
+      g_moe_group = gr0;
       g_moe_dedupe = dd0;
       g_moe_split = sp0;
       memcpy(m.h[0].host(), h0.data(), h0.size() * 4);

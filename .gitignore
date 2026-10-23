@@ -6,3 +6,4 @@ tests/golden/data/
 .venv/
 build-server/
 tests/golden/READY
+build-gguf/

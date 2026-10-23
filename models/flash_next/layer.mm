@@ -319,7 +319,7 @@ Scratch alloc_scratch(int rows) {
   s.br_m = alloc(DType::F32, {R, HID});
   s.hc_part = alloc(DType::F32, {LR / 8 + 1, HC, 8, R});
   s.hc_ctr = alloc(DType::U32, {64});
-  s.uq = alloc(DType::U32, {1 + R * TOPK * (2 + R) + 2 + 2 * R * TOPK});  // + lab-verify's split lists
+  s.uq = alloc(DType::U32, {1 + R * TOPK * (2 + R) + 2 + 2 * R * TOPK + 4 + 4 * R * TOPK + 18});  // + split lists, tiles, grids
   s.guo_u = alloc(DType::F32, {R * TOPK, R, 2, INTER});
   s.aq = alloc(DType::F32, {R, AQD});
   s.akv = alloc(DType::F32, {R, 2 * AKVD});
@@ -335,6 +335,19 @@ static std::string gname(const char *base, int g, int r) {
 }
 bool g_moe_split = getenv("NE_FN_MOE_SPLIT") && atoi(getenv("NE_FN_MOE_SPLIT")) > 0;
 bool moe_split(int R, const LayerW &w) { return g_moe_split && R > 1 && R <= 5 && w.t6; }
+int g_moe_group = [] {
+  const char *e = getenv("NE_FN_MOE_GROUP");
+  if (!e || !*e) return 2;  // default: grouped from 2 rows (lab-moegroup, docs/mtp.md 12.8); 0 = master's paths
+  const int v = atoi(e);
+  return v <= 0 ? 0 : std::max(2, v);
+}();
+int g_moe_spread = 0;
+bool g_moe_group_ind = [] {  // the grouped passes on indirect grids (live tiles only); NE_FN_MOE_GROUP_IND=0 = full grids
+  const char *e = getenv("NE_FN_MOE_GROUP_IND");
+  return !(e && std::string(e) == "0");
+}();
+bool moe_group(int R, const LayerW &w) { return g_moe_group > 0 && R >= g_moe_group && R > 1 && w.t6; }
+uint32_t moe_lists(int R, const LayerW &w) { return moe_group(R, w) ? 2u : moe_split(R, w) ? 1u : 0u; }
 int g_moe_dedupe = [] {  // lab-verify: max rows deduplicated (0 off); NE_FN_MOE_DEDUPE=1 = every R, N >= 2 = R <= N
   const char *e = getenv("NE_FN_MOE_DEDUPE");
   if (!e) return 3;  // default R 2-3 (verify d2: -0.3..-1.0 ms; slower from R 4: docs/mtp.md 12)
@@ -383,6 +396,36 @@ id<MTLComputePipelineState> pso(const std::string &name, int min_threads) {
   return p;
 }
 static MTLSize sz(int n) { return MTLSizeMake(n, 1, 1); }
+void record_moe_group(Recorder &r, Stage stage, const LayerW &w, Scratch &s, const Tensor &h_out) {
+  const MoeW &m = w.moe;
+  const int R = s.rows;
+  const uint32_t uR = (uint32_t)R;
+  // the tiles: G = uq + 1 + R TOPK (2 + R) + 2 + 2 R TOPK (fn_moe.metal)
+  const Tensor G = s.uq.view((size_t)(1 + R * TOPK * (2 + R) + 2 + 2 * R * TOPK) * 4, DType::U32, {4 + 4 * R * TOPK});
+  const size_t aoff = s.uq.offset + (size_t)(1 + R * TOPK * (2 + R) + 2 + 2 * R * TOPK + 4 + 4 * R * TOPK) * 4;
+  const bool ind = g_moe_group_ind && r.backend() != Backend::ICB;
+  const int maxt[3] = {R * TOPK, R * TOPK / 2, R * TOPK / 3};  // tiles of 1 / 2 / 4 rows at most
+  const int Ms[3] = {1, 2, 4};
+  const std::string kk = "_k" + std::to_string(m.gate.k) + "_m";
+  for (int c = 0; c < 3; c++) {
+    if (maxt[c] == 0) continue;
+    std::string ms = kk + std::to_string(Ms[c]);
+    if (stage == Stage::MoeGateUp && c > 0) {  // k phases of the 2- / 4-row gate / up tiles (NE_FN_MOE_P2 / _P4)
+      const char *pe = getenv(c == 1 ? "NE_FN_MOE_P2" : "NE_FN_MOE_P4");
+      const int ph = pe && *pe ? atoi(pe) : 1;
+      NE_CHECK(ph == 1 || ph == 2 || (ph == 4 && c == 2), "NE_FN_MOE_P%d=%s: 1, 2%s", Ms[c], pe, c == 2 ? " or 4" : "");
+      if (ph > 1) ms += "_p" + std::to_string(ph);
+    }
+    const bool gu = stage == Stage::MoeGateUp;
+    id<MTLComputePipelineState> p = gu ? pso("fn_moe_gateup_g" + ms) : pso("fn_moe_down_g" + ms, 512);
+    std::vector<Arg> a;
+    if (gu) a = {s.xm, m.gate.t, m.up.t, m.gate.suh, m.up.suh, s.route, s.guo, G, Arg::value(uR)};
+    else a = {s.guo, m.down.t, m.gate.svh, m.up.svh, m.down.suh, m.down.svh, s.route, s.logits, s.sho, s.h2,
+              s.inj_m, s.scr3, s.ctr3, h_out, s.br_m, G, Arg::value(uR)};
+    if (ind) r.dispatch_indirect(p, a, s.uq.buf, aoff + (size_t)((gu ? 0 : 9) + 3 * c) * 4, sz(gu ? 256 : 512));
+    else r.dispatch(p, a, sz(gu ? maxt[c] * 2 * (40 / 2) : maxt[c] * (HID / 128)), sz(gu ? 256 : 512));
+  }
+}
 
 const char *const kStageNames[(int)Stage::N] = {"attn_hc_pre", "attn_hc_mix", "gdn_in",     "gdn_step",
                                                 "gdn_out",     "mlp_hc_pre",  "mlp_hc_mix", "moe_router",
@@ -489,7 +532,7 @@ void record_stage(Recorder &r, Stage stage, const LayerW &w, GdnState &st, Scrat
     case Stage::MoeRouter:
       r.dispatch(pso("fn_moe_router" + rs),
                  {s.xm, m.router, m.sgate, m.sg.w, m.sg.s, m.sg.b, m.su.w, m.su.s, m.su.b, s.logits, s.gush, s.route,
-                  s.ctr1, s.uq, Arg::value((uint32_t)(moe_split(R, w) ? 1 : 0))},
+                  s.ctr1, s.uq, Arg::value(moe_lists(R, w) | (uint32_t)g_moe_spread << 8)},
                  sz((NE + 1 + 7) / 8 + 2 * INTER / 8), sz(256));
       r.barrier();
       break;
@@ -505,7 +548,9 @@ void record_stage(Recorder &r, Stage stage, const LayerW &w, GdnState &st, Scrat
       r.barrier();
       break;
     case Stage::MoeDown:
-      if (R > 1 && R <= g_moe_dedupe && !moe_split(R, w))
+      if (moe_group(R, w))
+        record_moe_group(r, stage, w, s, h_out);
+      else if (R > 1 && R <= g_moe_dedupe && !moe_split(R, w))
         r.dispatch(pso("fn_moe_down_u" + k, 512),
                    {s.guo_u, m.down.t, m.gate.svh, m.up.svh, m.down.suh, m.down.svh, s.uq, s.logits, s.sho, s.h2,
                     s.inj_m, s.scr3, s.ctr3, h_out, s.br_m},

@@ -49,7 +49,8 @@ struct Prefill {
   Tensor cnt, rank, off, wtab, order, seid, inv, pg, pu, ig, iu, pd, dn;  // routed experts
   Tensor pemb_f, pemb, pkv, pgv, pnrm;             // PLE
   Tensor posbase;                                  // u32 [4]: T before the chunk
-  Tensor dfl_fs;                                   // lab-dflash: f32 [2048][12800] feature ring by position (or empty)
+  Tensor dfl_fs;    // lab-dflash: f32 [2048][12800] feature ring by position, owned here (or empty); see prefill_dfl_ring
+  Tensor dfl_flag;  // u32 [4]: [0] = 1 while a drafter model's call captures (lab-dflfix: others write nothing)
   t6::PfBuf t6pf;                                  // lab-t6wire: EXL3 trunk (allocated when the model has t6 layers)
   attn::ChunkScratch ac;                           // lab-attn's chunk attention scratch (kernels/attn/qsa_chunk.h)
   bool shared = false;  // chunk buffers lent by another model's Prefill (prefill_create donor)
@@ -337,7 +338,7 @@ static Prefill::Rec &get_rec(Prefill &p, int n, int T0) {
     if (p.dfl_fs.buf && dfl_slot((int)l) >= 0) {  // lab-dflash: the last <= 2048 rows' features -> the ring by position
       const uint32_t r0 = (uint32_t)std::max(0, n - 2048);
       struct { uint32_t x, y, z, w; } a{(uint32_t)n - r0, (uint32_t)dfl_slot((int)l), r0, 0};
-      sg.r(PfStage::HcGlue).dispatch(pso("dfl_hc_mean_ring"), {hout, p.dfl_fs, p.posbase, Arg::value(a)},
+      sg.r(PfStage::HcGlue).dispatch(pso("dfl_hc_mean_ring"), {hout, p.dfl_fs, p.posbase, Arg::value(a), p.dfl_flag},
                                      sz1(cdiv((int)(n - r0) * HID, 256)), sz1(256));
     }
   }
@@ -707,11 +708,17 @@ StepOut prefill_prompt(Prefill &p, const int *prompt, int n) {
 
 const PfStats &prefill_stats(const Prefill &p) { return p.stats; }
 const Tensor &prefill_hidden(const Prefill &p, int layers) { return p.h[layers % 2]; }
-void prefill_set_dfl(Prefill &p, const Tensor *fs) {
-  const bool same = fs ? (p.dfl_fs.buf == fs->buf && p.dfl_fs.offset == fs->offset) : !p.dfl_fs.buf;
-  if (same) return;
-  p.dfl_fs = fs ? *fs : Tensor();
-  p.recs.clear();  // the chunk recordings bind (or not) the feature ring
+const Tensor &prefill_dfl_ring(Prefill &p) {
+  if (!p.dfl_fs.buf) {
+    p.dfl_fs = alloc(DType::F32, {2048, 5 * HID});
+    p.dfl_flag = alloc(DType::U32, {4});
+    memset(p.dfl_flag.host(), 0, 16);
+    p.recs.clear();  // the chunk recordings bind the ring from now on (once per Prefill)
+  }
+  return p.dfl_fs;
+}
+void prefill_dfl_capture(Prefill &p, bool on) {
+  if (p.dfl_flag.buf) ((uint32_t *)p.dfl_flag.host())[0] = on ? 1u : 0u;
 }
 
 }  // namespace ne::fn

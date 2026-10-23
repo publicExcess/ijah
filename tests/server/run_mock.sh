@@ -69,6 +69,22 @@ for ph in A B; do
   sleep 1; kill $SP; wait $SP 2>/dev/null
 done
 grep -c "401" $T/log | sed 's/^/401 log lines: /'
+echo "--- DFlash2 by default, -dflash aliases (mock engine; a stand-in drafter dir, then --drafter none)"
+mkdir -p $T/drafter && for f in config.json model.safetensors; do echo '{}' > $T/drafter/$f; done
+for dm in dflash2 mtp; do
+  DA=(--drafter-path $T/drafter); [ $dm = mtp ] && DA=(--drafter none)
+  $PY server/ne_server.py --mock --mock-delay 0.002 --model-id Swift-1.5-Flash-Next-native $DA --port $PORT --key-file $T/key --ctx 32768 2> $T/log7$dm &
+  SP=$!
+  for i in {1..60}; do curl -s -m 1 http://127.0.0.1:$PORT/health >/dev/null 2>&1 && break; sleep 0.5; done
+  $PY tests/server/test_drafter_http.py --url http://127.0.0.1:$PORT --key-file $T/key --model Swift-1.5-Flash-Next-native --drafter $dm | grep -v '^ok' ; [ ${pipestatus[1]} = 0 ] || rc=1
+  kill $SP; wait $SP 2>/dev/null
+done
+$PY server/ne_server.py --mock --model-id Swift-1.5-Flash-Next-native-dflash --drafter-path $T/nothing --port $PORT --key-file $T/key 2> $T/log8 \
+  && { echo "FAIL a -dflash id without its drafter started"; rc=1; } \
+  || { grep -q "needs its DFlash2 drafter checkpoint" $T/log8 && echo "ok: a -dflash id without its drafter refuses to start" \
+       || { echo "FAIL: $(tail -1 $T/log8)"; rc=1; }; }
+echo "--- tools/ijah over tools/serve.sh (mock engine, port 8146)"
+tests/server/test_ijah_cli.sh | grep -v '^ok' ; [ ${pipestatus[1]} = 0 ] || rc=1
 echo "--- with_lock.sh: stale locks, swap rate window (fake vm_stat), low-RAM samples"
 tests/server/test_with_lock.sh | grep -v '^ok' ; [ ${pipestatus[1]} = 0 ] || rc=1
 echo "--- supervisor + SSD tier across a crash (mock engine, port 8147)"

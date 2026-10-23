@@ -174,6 +174,167 @@ int main() {
     printf("copy rule: naive cross-check %d mismatches of 12000 lookups (%d matches)\n", bad, hits);
     CHECK(bad == 0 && hits > 1000, "copy_find vs naive: %d mismatches", bad);
   }
+  {  // lab-dfllook: AcceptFit recovers known parameters from labels (logit p = 1.7 logit c + (0.8 - 0.4 j))
+    AcceptFit f;
+    const double i0[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    f.reset(1.0, i0);
+    f.cap = 1 << 16;
+    Rng rg(99);
+    for (int r = 0; r < 40000; r++) {
+      const double c = 0.05 + 0.9 * rg.uniform();
+      const int j = r % 4;
+      const double z = 1.7 * std::log(c / (1 - c)) + 0.8 - 0.4 * j;
+      f.add(c, j, rg.uniform() < 1 / (1 + std::exp(-z)));
+    }
+    f.refit();
+    f.refit();
+    printf("AcceptFit recovery: slope %.3f (1.7), icpt %.3f %.3f %.3f %.3f (0.8 0.4 0.0 -0.4)\n", f.slope, f.icpt[0], f.icpt[1],
+           f.icpt[2], f.icpt[3]);
+    CHECK(std::fabs(f.slope - 1.7) < 0.1 && std::fabs(f.icpt[0] - 0.8) < 0.1 && std::fabs(f.icpt[3] + 0.4) < 0.1,
+          "AcceptFit does not recover the parameters");
+  }
+  {  // lab-dflfix: the gated verify (gate_prefix) + exact accept over whole generations is distributed as the target
+    // chain. Synthetic chain over V = 4 tokens: p(. | prefix), drafts q(. | prefix + drafts) (correlated with p, = p on
+    // some prefixes); rounds of K = 4 sampled drafts, the gate picks the verified prefix, accept_sampled_p, repeat until
+    // 4 tokens are out. The joint of the first 4 tokens (256 cells) vs the exact chain: chi-square, and every position's
+    // marginal. Power check: the 19 Oct rule (max over k of E / cost with q(d_j) of the drawn drafts) must fail.
+    constexpr int V = 4, K = 4, L = 4;
+    auto hsh = [](const std::vector<int> &v, uint64_t salt) {
+      uint64_t h = 1469598103934665603ull ^ salt;
+      for (int x : v) { h ^= (uint64_t)(x + 1); h *= 1099511628211ull; }
+      h ^= h >> 29; h *= 0xBF58476D1CE4E5B9ull; h ^= h >> 32;
+      return h;
+    };
+    auto softmax = [](const double *l, Dist &d) {
+      double mx = l[0], z = 0, w[V];
+      for (int i = 1; i < V; i++) mx = std::max(mx, l[i]);
+      for (int i = 0; i < V; i++) z += (w[i] = std::exp(l[i] - mx));
+      d.ids.clear(); d.p.clear();
+      for (int i = 0; i < V; i++) { d.ids.push_back(i); d.p.push_back((float)(w[i] / z)); }
+    };
+    auto pdist = [&](const std::vector<int> &pre, Dist &d) {
+      const uint64_t h = hsh(pre, 1);
+      const double sharp = 0.5 + 2.5 * ((h >> 8) % 4) / 3.0;
+      double l[V];
+      for (int i = 0; i < V; i++) l[i] = sharp * (((h >> (16 + 8 * i)) & 255) / 127.5 - 1.0);
+      softmax(l, d);
+    };
+    auto qdist = [&](const std::vector<int> &pre, Dist &d) {
+      const uint64_t h = hsh(pre, 2);
+      pdist(pre, d);
+      if (h % 4 == 0) return;  // q = p on a quarter of the prefixes (the reviewer's case)
+      double l[V];
+      for (int i = 0; i < V; i++) l[i] = std::log(std::max(1e-9, (double)d.p[i])) + 1.5 * (((h >> (8 * i)) & 255) / 127.5 - 1.0);
+      softmax(l, d);
+    };
+    const double acc[10] = {0.22, 0.37, 0.40, 0.48, 0.52, 0.48, 0.58, 0.57, 0.71, 0.93};  // the shipped priors
+    const double cost[9] = {14.0, 14.5, 20.2, 23.9, 27.3, 31.6, 34.4, 37.5, 40.5};
+    GateParams g;
+    g.acc = acc;
+    g.cost = cost;
+    g.rate = 0.11;
+    auto old_rule = [&](const Dist *q, const int *dr, int Kk) {  // 19 Oct: argmax_k E(k) / cost(k + 1), q(d_j) drawn
+      int best = 1;
+      double bv = -1, run = 1, e = 1;
+      for (int k = 1; k <= Kk; k++) {
+        run *= acc[gate_bin(q[k - 1].prob(dr[k - 1]))];
+        e += run;
+        if (e / cost[k + 1] > bv) { bv = e / cost[k + 1]; best = k; }
+      }
+      return best;
+    };
+    // the exact joint of the first L tokens
+    std::vector<double> want(256, 0.0);
+    for (int c = 0; c < 256; c++) {
+      std::vector<int> pre;
+      double pr = 1;
+      for (int t = 0; t < L; t++) {
+        Dist d;
+        pdist(pre, d);
+        const int x = (c >> (2 * t)) & 3;
+        pr *= d.p[x];
+        pre.push_back(x);
+      }
+      want[c] = pr;
+    }
+    AcceptFit fit;
+    for (int rule = 0; rule < 4; rule++) {  // 0: gate_prefix at rate 0.11, 1: at 0.035 (deeper prefixes), 2: old, 3: lookahead (lab-dfllook)
+      const double i0[8] = {0.6, 0.5, 0.4, 0.4, 0.3, 0.3, 0.3, 0.3};
+      fit.reset(1.0, i0);
+      g.rate = rule == 1 ? 0.035 : 0.11;
+      Rng rg(777 + rule);
+      const int N = 2000000;
+      std::vector<double> got(256, 0.0);
+      int byk[K + 1] = {};
+      for (int run = 0; run < N; run++) {
+        std::vector<int> out;
+        while ((int)out.size() < L) {
+          Dist q[K], pp[K + 1];
+          int dr[K];
+          std::vector<int> pre = out;
+          for (int j = 0; j < K; j++) {
+            qdist(pre, q[j]);
+            dr[j] = q[j].sample(rg.uniform());
+            pre.push_back(dr[j]);
+          }
+          // lab-dfllook: confidences fixed before any draw of the round, from the round's start along q's own argmax path
+          // (the stand-in for DFlash2's unary readout, which the draws do not touch)
+          double conf[K];
+          {
+            std::vector<int> gp = out;
+            for (int j = 0; j < K; j++) {  // the p / q overlap along that path: predictive, still no draw involved
+              Dist c, t;
+              qdist(gp, c);
+              pdist(gp, t);
+              int am = 0;
+              double ov = 0;
+              for (int x = 0; x < V; x++) {
+                if (c.p[x] > c.p[am]) am = x;
+                ov += std::min(c.p[x], t.p[x]);
+              }
+              conf[j] = ov;
+              gp.push_back(am);
+            }
+          }
+          const int k = rule < 2 ? gate_prefix(q, dr, K, g) : rule == 2 ? old_rule(q, dr, K)
+                                                                       : gate_lookahead(conf, K, fit, cost);
+          byk[k]++;
+          pre = out;
+          for (int j = 0; j <= k; j++) {
+            pdist(pre, pp[j]);
+            if (j < k) pre.push_back(dr[j]);
+          }
+          const VerifyResult r = accept_sampled_p(dr, k, pp, q, rg);
+          if (rule == 3) {  // the online refit (labels of the verified positions), as the loop does
+            for (int j = 0; j < k && j <= r.accepted; j++) fit.add(conf[j], j, j < r.accepted);
+            fit.round_done();
+          }
+          for (int x : r.emitted) out.push_back(x);
+        }
+        int c = 0;
+        for (int t = 0; t < L; t++) c |= out[t] << (2 * t);
+        got[c] += 1;
+      }
+      double chi = 0, zmax = 0;
+      for (int c = 0; c < 256; c++) chi += (got[c] - N * want[c]) * (got[c] - N * want[c]) / (N * want[c]);
+      for (int t = 0; t < L; t++)
+        for (int x = 0; x < V; x++) {
+          double gm = 0, wm = 0;
+          for (int c = 0; c < 256; c++) if (((c >> (2 * t)) & 3) == x) { gm += got[c]; wm += want[c]; }
+          zmax = std::max(zmax, std::fabs(gm - N * wm) / std::sqrt(N * wm * (1 - wm)));
+        }
+      printf("gate %s: %d generations, rounds verifying 1/2/3/4 drafts %d/%d/%d/%d; joint of 4 tokens chi2 %.1f (255 dof; "
+             "99.9%% 341), worst marginal |z| %.2f\n", rule == 0 ? "gate_prefix rate 0.11" : rule == 1 ? "gate_prefix rate 0.035" : rule == 2 ? "19 Oct rule (biased)"
+                                                                                       : "lookahead + online refit", N,
+             byk[1], byk[2], byk[3], byk[4], chi, zmax);
+      if (rule != 2) CHECK(chi < 341 && zmax < 4.5, "gate_prefix not distribution-preserving: chi2 %.1f, |z| %.2f", chi, zmax);
+      else CHECK(chi > 1000, "power check: the biased 19 Oct rule was not detected (chi2 %.1f)", chi);
+      CHECK(byk[1] > N / 50 && byk[2] + byk[3] + byk[4] > N / 50, "gate never varies k (%d / %d)", byk[1], byk[2]);
+      if (rule == 3) printf("lookahead fit after the run: slope %.2f, icpt %.2f %.2f %.2f %.2f\n", fit.slope, fit.icpt[0],
+                            fit.icpt[1], fit.icpt[2], fit.icpt[3]);
+      if (rule == 1 || rule == 3) CHECK(byk[3] > N / 100 && byk[4] > N / 100, "rate 0.035: no deep prefixes (%d / %d)", byk[3], byk[4]);
+    }
+  }
   printf(fails ? "accept_test: %d FAILED\n" : "accept_test: all passed\n", fails);
   return fails ? 1 : 0;
 }

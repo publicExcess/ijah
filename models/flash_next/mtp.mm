@@ -433,6 +433,114 @@ VerifyResult accept_sampled_p(const int *drafts, int D, const Dist *pd_, const D
   return r;
 }
 
+int gate_bin(double q) { return std::clamp((int)(q * 10.0), 0, 9); }
+double gate_expected(const Dist &q, const double *acc) {
+  double e = 0;
+  for (size_t i = 0; i < q.ids.size(); i++) e += (double)q.p[i] * acc[gate_bin(q.p[i])];
+  return e;
+}
+int gate_prefix(const Dist *q, const int *drafts, int K, const GateParams &g) {
+  int k = 1;
+  double run = 1.0;
+  for (int j = 2; j <= K; j++) {
+    run *= g.acc[gate_bin(q[j - 2].prob(drafts[j - 2]))];  // d_<j: drawn and (if reached) accepted before d_j
+    const double gain = run * gate_expected(q[j - 1], g.acc), dc = g.cost[j + 1] - g.cost[j];
+    if (gain < g.rate * dc) break;
+    k = j;
+  }
+  return k;
+}
+
+static double logit_c(double c) {
+  c = std::clamp(c, 1e-4, 1.0 - 1e-4);
+  return std::log(c / (1.0 - c));
+}
+void AcceptFit::reset(double slope0, const double *icpt0) {
+  slope = slope0;
+  for (int j = 0; j < 8; j++) icpt[j] = icpt0[j];
+  c.clear();
+  pos.clear();
+  y.clear();
+  head = 0;
+  rounds = 0;
+}
+double AcceptFit::prob(double conf, int j) const {
+  return 1.0 / (1.0 + std::exp(-(slope * logit_c(conf) + icpt[std::clamp(j, 0, 7)])));
+}
+void AcceptFit::add(double conf, int j, bool accepted) {
+  if ((int)c.size() < cap) {
+    c.push_back((float)conf);
+    pos.push_back((uint8_t)std::clamp(j, 0, 7));
+    y.push_back(accepted ? 1 : 0);
+  } else {
+    c[head] = (float)conf;
+    pos[head] = (uint8_t)std::clamp(j, 0, 7);
+    y[head] = accepted ? 1 : 0;
+    head = (head + 1) % (size_t)cap;
+  }
+}
+void AcceptFit::round_done() {
+  if (++rounds % every == 0) refit();
+}
+// IRLS on (slope, icpt[0..7]) with a small ridge toward the current values (positions without labels keep theirs)
+void AcceptFit::refit() {
+  const int n = (int)c.size();
+  if (n < 64) return;
+  double th[9];
+  th[0] = slope;
+  for (int j = 0; j < 8; j++) th[1 + j] = icpt[j];
+  const double prior[9] = {th[0], th[1], th[2], th[3], th[4], th[5], th[6], th[7], th[8]};
+  for (int it = 0; it < 6; it++) {
+    double g[9] = {}, H[9][9] = {};
+    for (int i = 0; i < 9; i++) {  // ridge 1.0 toward the prior
+      g[i] -= 1.0 * (th[i] - prior[i]);
+      H[i][i] += 1.0;
+    }
+    for (int r = 0; r < n; r++) {
+      const double x = logit_c(c[r]);
+      const int j = pos[r];
+      const double z = th[0] * x + th[1 + j], p = 1.0 / (1.0 + std::exp(-z)), w = std::max(p * (1 - p), 1e-6);
+      const double e = y[r] - p;
+      g[0] += e * x;
+      g[1 + j] += e;
+      H[0][0] += w * x * x;
+      H[0][1 + j] += w * x;
+      H[1 + j][0] += w * x;
+      H[1 + j][1 + j] += w;
+    }
+    // solve H d = g (9 x 9, Gaussian elimination with partial pivoting)
+    double A[9][10];
+    for (int i = 0; i < 9; i++) {
+      for (int k = 0; k < 9; k++) A[i][k] = H[i][k];
+      A[i][9] = g[i];
+    }
+    for (int col = 0; col < 9; col++) {
+      int piv = col;
+      for (int r2 = col + 1; r2 < 9; r2++) if (std::fabs(A[r2][col]) > std::fabs(A[piv][col])) piv = r2;
+      for (int k = 0; k < 10; k++) std::swap(A[col][k], A[piv][k]);
+      for (int r2 = 0; r2 < 9; r2++) {
+        if (r2 == col) continue;
+        const double f = A[r2][col] / A[col][col];
+        for (int k = col; k < 10; k++) A[r2][k] -= f * A[col][k];
+      }
+    }
+    for (int i = 0; i < 9; i++) th[i] += std::clamp(A[i][9] / A[i][i], -2.0, 2.0);
+  }
+  slope = std::clamp(th[0], 0.05, 5.0);
+  for (int j = 0; j < 8; j++) icpt[j] = std::clamp(th[1 + j], -6.0, 6.0);
+}
+int gate_lookahead(const double *conf, int K, const AcceptFit &f, const double *cost) {
+  int best = 1;
+  double run = 1.0, e = 1.0, bv = -1.0;
+  for (int k = 1; k <= K; k++) {
+    run *= f.prob(conf[k - 1], k - 1);
+    e += run;
+    const double v = e / cost[k + 1];
+    if (v > bv) { bv = v; best = k; }
+  }
+  return best;
+}
+
 CommitPlan plan_commit(int T0, int D, int accepted, int head_appended) {
   NE_CHECK(accepted >= 0 && accepted <= D, "accepted %d of %d", accepted, D);
   CommitPlan c;

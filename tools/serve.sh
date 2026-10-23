@@ -9,6 +9,7 @@
 #            watchdog) it is started again after a backoff (10, 20, 40, 80, 160 s; gives up after 5 crashes that each
 #            ran < 10 min), through with_lock again (lock + NEED_GB: while either refuses it waits, 60 s steps, up to
 #            30 min). Waits until /health answers. Extra args go to the server (e.g. --ctx 65536)
+#   run      the server in the foreground (no supervisor; for launchd / brew services, which restart it), same rules
 #   stop     stop the supervisor, SIGTERM the server (pid file), wait, release (with_lock releases the lock)
 #   state    one line (for a status-bar plugin or scripts): running | starting | crashed ... | waiting ... | failed ... | stopped
 #   models   the model ids of server/models.json and the pack each resolves to
@@ -18,6 +19,8 @@
 #   NE_MODEL=Qwen3.8-Flash-Next-native,Swift-1.5-Flash-Next-native tools/serve.sh start   (both in one process: the
 #   experts shared, requests routed by `model`; NE_MODEL=all = every registry id; NEED_GB defaults to 96 then;
 #   NE_SHARE_STATE=1: the models time-share one KV + recurrent state per slot, --share-state: ~6 GB less at 262K)
+# tools/ijah serve start|stop|status|log|restart wraps this (tools/ijah --help).
+# Drafter: the plain ids use DFlash2 when its checkpoint is present (NE_DRAFTER=none: the MTP head; docs/server.md 14).
 # Never starts next to another model server: with_lock's NEED_GB check refuses when the RAM is taken.
 # Files: the key in ~/.config/ijah (IJAH_KEY_FILE), log / pid / supervisor state in ~/.cache/ijah (NE_HOME: both).
 set -u
@@ -118,6 +121,29 @@ supervise() {  # serve.sh _supervise UNTIL -- server args   (started detached by
   rm -f $SUP.pid $SUP.stop
 }
 
+server_args() {  # -> sargs (shim, model ids, share-state) and need (NEED_GB) from NE_MODEL / NE_SHARE_STATE
+  local shim=$(shim_path)
+  sargs=(); [ -f $shim ] && sargs=(--shim $shim)
+  need=${NEED_GB:-85}
+  if [ "${NE_MODEL:-}" = all ]; then sargs+=(--models all); need=${NEED_GB:-96}
+  elif [ -n "${NE_MODEL:-}" ]; then sargs+=(--model-id $NE_MODEL); [[ $NE_MODEL == *,* ]] && need=${NEED_GB:-96}; fi
+  [ "${NE_SHARE_STATE:-0}" = 1 ] && sargs+=(--share-state)
+}
+
+run_fg() {  # serve.sh run [-- server args]: the server in the foreground under with_lock, no supervisor (launchd /
+            # brew services restart it: KeepAlive); the same key, build, model and NEED_GB rules as start
+  [ "${1:-}" = "--" ] && shift
+  if listening; then echo "port $PORT is in use"; return 1; fi
+  ijah_need_py
+  [ -s $KEY ] || keygen
+  [ "${NE_SKIP_BUILD:-0}" = 1 ] || build || return 1
+  local sargs=() need
+  server_args
+  mkdir -p ${LOG:h}
+  echo "$(date '+%F %T') run ($LIB) $*" >> $LOG
+  NEED_GB=$need run_once 23:59 $sargs "$@"
+}
+
 start() {
   local until=23:59
   [ $# -gt 0 ] && [ "$1" != "--" ] && { until=$1; shift; }
@@ -127,12 +153,8 @@ start() {
   ijah_need_py
   [ -s $KEY ] || keygen
   [ "${NE_SKIP_BUILD:-0}" = 1 ] || build || return 1
-  local shim=$(shim_path) sargs=()
-  [ -f $shim ] && sargs=(--shim $shim)
-  local need=${NEED_GB:-85}
-  if [ "${NE_MODEL:-}" = all ]; then sargs+=(--models all); need=${NEED_GB:-96}
-  elif [ -n "${NE_MODEL:-}" ]; then sargs+=(--model-id $NE_MODEL); [[ $NE_MODEL == *,* ]] && need=${NEED_GB:-96}; fi
-  [ "${NE_SHARE_STATE:-0}" = 1 ] && sargs+=(--share-state)
+  local sargs=() need
+  server_args
   mkdir -p $RUN_NE
   rm -f $SUP.stop
   echo "$(date '+%F %T') start ($LIB) $*" >> $LOG
@@ -206,11 +228,12 @@ case ${1:-status} in
   keygen) keygen ;;
   build) build ;;
   start) shift; start "$@" ;;
+  run) shift; run_fg "$@" ;;
   stop) stop ;;
   state) state ;;
   _supervise) shift; supervise "$@" ;;
   models) $PY -I -B $ROOT/server/ne_server.py --list-models ;;
   status) if listening; then echo "listening on $PORT: $(curl -s -m 2 http://127.0.0.1:$PORT/health); $(state)"; else echo "not running: $(state)"; fi ;;
   log) tail -n ${2:-40} $LOG ;;
-  *) echo "usage: [NE_MODEL=id] tools/serve.sh keygen | build | start [UNTIL] [-- args] | stop | status | state | log [N] | models"; exit 64 ;;
+  *) echo "usage: [NE_MODEL=id] tools/serve.sh keygen | build | start [UNTIL] [-- args] | run [-- args] | stop | status | state | log [N] | models"; exit 64 ;;
 esac

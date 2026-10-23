@@ -2,6 +2,7 @@
 
 Owners: sections 0-9 lab-mtp (15 Oct, finished); 10.9 lab-mtpcont (16 Oct); since then **lab-loop** owns `models/flash_next/mtp*`, `tests/mtp/`,
 `tools/bench_mtp*` and this file, **lab-speed** owns `kernels/nax/`. Section 10 = the MTP token loop (lab-loop).
+Section 13 = the DFlash2 block drafter (lab-dflash 19 Oct, lab-dflfix 23 Oct; opt-in `-dflash` ids; exact gate since 23 Oct: indicative +8% short, parity at 8K / 32K).
 Section 11 = drafting at real settings (lab-draft, 18 Oct): pruned draft vocabulary + copy rule, **same-client server
 108.9 vs 105.6 tok/s (1.031 [1.028, 1.035], 18 / 18), whole-file edits +23%**.
 **Headline (section 10): MTP generates end to end on the engine: 101 tok/s sampled, 92 greedy at depth 2 (thinking
@@ -349,6 +350,8 @@ head's own layer (0.42 ms: a 1-row attention + MoE K4 step), then MoE bytes per 
   IS", WITHOUT WARRANTY OF ANY KIND; full text in the upstream LICENSE). No Sushi code is copied.
 - The head math and lifecycle follow mlx-vlm 0.7.7 `speculative/drafters/qwen4_exp_mtp` and `mtp_base.py` (MIT).
 - `mtp_gdn_step_rows` is lab-forward's `fn_gdn_step` (this repo) plus the snapshot stores.
+- The grouped routed experts (12.8) follow Splash 1.4's MoE grouping (incoai/splash, Apache-2.0, PRs #454 / #455 /
+  #456: routes gathered into per-expert tiles, an expert's small tile run as a column GEMV); design only, no code copied.
 
 ## 10. The MTP token loop (lab-loop)
 
@@ -751,6 +754,11 @@ per 1,024 tokens, d2 112.2 vs 112.5 without, d3 110.3 vs 108.7 (noise).
 
 ### 11.4 Gated verify (opt-in `NE_MTP_QGATE=1`, `ne_fn_mtp_set_qgate`) and the depth (retuned for the cheaper drafting)
 
+> **Correction (lab-dflfix, 23 Oct): the rule below was NOT distribution-preserving.** It picked k from q(d_j) of the
+> drawn drafts, so whether d_j was verified depended on d_j itself (cut positions are fresh draws from p). "Looks only
+> at the drafts, never at the target" is not enough. Replaced by the exact `mtp::gate_prefix` (section 13.9); the
+> gated numbers in this section and 11.5 were measured with the biased rule.
+
 With drafting at 0.74 ms a step, drafting one deeper is cheap; verifying a row is not (+3.0-3.6 ms). So the loop now
 drafts the fixed depth Dd, reads the drafts and their proposals q (sampled drafting: what each d_j was drawn from),
 and verifies only the prefix k <= Dd that maximises E[tokens](k) - rate x vcost(k + 1): E(k) = 1 + sum_{j<=k}
@@ -942,7 +950,85 @@ measured 24.1-26.2 ms at d3 today). Default off. Gate/up only: the down still re
 concurrent dispatches over one barrier did not hide the multi kernel's R-row prep. The router builds the lists only
 when the split runs (a constant argument), so the default path does no extra work; `make test` ALL PASS after it.
 
-## 13. DFlash2 block drafter (lab-dflash, 19 Oct; opt-in `--drafter dflash2`)
+### 12.8 Grouped routed experts (lab-moegroup, 23 Oct; default from 2 rows, `NE_FN_MOE_GROUP=0` = the old paths)
+
+Each touched expert is read once per tile of <= 4 of its rows instead of once per (row, slot) pair. The router's
+finisher (mode 2 of its `split` argument) writes per-expert tiles: an expert used by c rows gets c / 4 tiles of 4 and
+one tile of the remainder (1 / 2 / 3 rows; 3 padded to 4). `fn_moe_gateup_g` / `fn_moe_down_g` (K4 / K5 / K6, M = 1 / 2 / 4
+rows; T6 layers) run one dispatch per tile size, with no barrier between, on indirect grids of the live tiles (the
+finisher writes the threadgroup counts). The M = 1 tiles are 12.7's singles. Threadgroup memory: gate/up M x 5 KB
+(the partial sums alias the prep), down M x 2.25 KB, so at most 20 KB, and only on the 4-row tiles.
+Each row keeps the per-pair kernels' arithmetic: the same prep, each simdgroup the same k tiles in the same order, the
+same reductions, the same slot-ordered finisher. So the outputs are **bit-identical** to `NE_FN_MOE_DEDUPE=0`
+(per pair at every R), which is master's path at R = 1 and R >= 4. At R 2-3 master runs the old dedupe kernels, which differ from per pair at f32
+rounding (12.5); the grouped path replaces them there too (it is faster, below). This is Splash 1.4's idea (rows
+gathered into per-expert tiles, small tiles run as column GEMVs: incoai/splash PRs #454-#456, Apache-2.0) on our
+GEMV kernels. No Splash code is copied.
+
+Correctness:
+- fn-prof `NE_PROF_DDCHECK=group`, R 2-8, K4s-T6 and K5-T6, 4 loaded layers: max |diff| 0 after 1 / 4 / 48 layers,
+  and the tile lists check out (every pair in one tile, one expert per tile).
+- Whole model, greedy, `bench_draft --prompts x16 --greedy` (16 prompts x 256 tokens), group off (dedupe 0) vs on,
+  MTP d3 / d7 and DFlash2 k 7: 64 / 64 runs token-identical on each pack.
+- `make test` ALL PASS.
+
+Test knob: `NE_PROF_SPREAD=p` (fn-prof only) moves p % of synthetic rows 1.. R-1's slots to other experts, because random
+rows route almost alike (22 distinct of 60 at R 6). p = 35 gives roughly real text's overlap: 29 / 34-42 / 36-44
+distinct at R 4 / 6 / 8, against real 26.9 / 35.8 / 43.4. Trap: an earlier version could put one expert twice in a row.
+The dedupe kernels' per-row slot nibbles cannot represent that, so their counters went stale, and the next recording
+showed spurious run-to-run differences at R 2-3. Real routing never repeats an expert in a row, and the knob no longer
+does either.
+
+Speed (one indicative run each; ms):
+
+| | R 2 | R 3 | R 4 | R 5 | R 6 | R 7 | R 8 | per extra row |
+|---|---|---|---|---|---|---|---|---|
+| fn-prof body, K4s-T6, old -> grouped | 13.79 -> 13.57 | 16.24 -> 16.11 | 19.27 -> 17.55 | 21.62 -> 19.69 | 24.49 -> 21.69 | 26.93 -> 24.49 | 30.33 -> 26.00 | 2.70 -> 2.05 |
+| fn-prof body, K5-T6 | 14.51 -> 14.10 | 17.08 -> 16.89 | 21.47 -> 18.86 | 24.88 -> 21.13 | 29.61 -> 26.27 | 33.62 -> 27.77 | 36.32 -> 29.92 | 3.50 -> 2.54 |
+| in-loop MTP verify, K4s (bench_draft, sampled, 6 x 512) | 15.74 -> 15.54 | 19.28 -> 18.58 | 22.38 -> 21.03 | 25.14 -> 23.27 | 28.33 -> 25.98 | 31.03 -> 27.53 | 33.29 -> 29.02 | 2.93 -> 2.25 |
+| in-loop MTP verify, T6 | 16.50 -> 16.24 | 20.61 -> 19.93 | 23.89 -> 22.46 | 26.93 -> 24.92 | 30.29 -> 27.47 | 33.60 -> 29.76 | 36.64 -> 31.95 | 3.36 -> 2.62 |
+| in-loop DFlash2 round (+ host), T6 | 20.07 -> 19.65 | 24.01 -> 23.17 | 27.52 -> 25.69 | 30.71 -> 28.11 | 34.01 -> 30.73 | 37.19 -> 33.12 | 40.22 -> 35.20 | 3.36 -> 2.59 |
+
+On real text the saving is 0.68-0.77 ms per extra row, not the ~0.9 hoped for. The expert bytes do drop as 12.2
+predicts, but the grouped gate/up runs below the read peak: at R 6 on K4s it does ~57 MB in 125 us, ~460 GB/s. The
+4-row tiles do 4 rows' dots per decoded weight, and the EXL3 decode is already near the ALU floor. Two variants ran
+level within the noise: k phases for the 2- / 4-row gate/up tiles (`NE_FN_MOE_P2` / `_P4`, prep in 2 or 4 parts, 5-10
+KB) and full grids (`NE_FN_MOE_GROUP_IND=0`, +0.3 to +1.3 ms).
+
+In-process tok/s, sampled, 6 h2h prompts (mean, old -> grouped):
+- MTP fixed depth, K4s: d2 114.0 -> 118.6, d3 116.8 -> 125.2, d5 108.9 -> 118.5, d7 94.4 -> 107.4.
+- MTP fixed depth, T6: d3 109.1 -> 116.4.
+- Best MTP depth, K4s: still d3, now 125 instead of 117.
+- DFlash2 with its exact gate (kmax 5; 6 x 1,024 x 2 seeds): K4s 123.3 -> 130.7 (1.058, 12 / 12 wins), T6 116.9 -> 126.1
+  (1.077, 12 / 12).
+
+The gate's cost table (`dfl_costs`) is a fixed prior: round ms by R, not learned from wall time (13.9). A grouped table
+from the round costs above (`ne_fn_dfl_set_vcost(p, 1)`, bench_draft `@vc=1`) makes the gate verify more rows: 3.94
+instead of 3.73 per round. tok/s stays level, though: 1.046 / 1.072 against 1.058 / 1.077 with the old table, on
+K4s / T6. kmax 7 with the grouped table: 1.078 / 1.084 (4.29 rows per round). Both are within the noise of the old
+table, so the old table stays the default.
+
+Same client, light: `tests/h2h/night1018/moegroup_ab.sh`.
+- Setup: the `-dflash` id with `--seed-mtp`; 6 prompts x 2 seeds x 1,024 tokens; this worktree's build in both arms.
+  The old arm sets `NE_FN_MOE_GROUP=0`.
+- Order: k4-pair, k4-group, t6-group, t6-pair. One run each, so indicative only.
+- Results are in `results/1023-1102-moegroup`:
+
+| | old tok/s | grouped tok/s | paired ratio (min-max), wins |
+|---|---|---|---|
+| K4s-T6 + DFlash2 | 131.0 | 135.5 | 1.036 (0.95-1.13), 10 / 12 |
+| T6 + DFlash2 | 119.5 | 127.8 | **1.069** (1.03-1.11), 12 / 12 |
+
+## 13. DFlash2 block drafter (lab-dflash, 19 Oct; opt-in, the `-dflash` model ids)
+
+> **23 Oct (release): the default.** The plain model ids use the drafter when its checkpoint is present (exact gate,
+> 8192-token block cap); without it the MTP head drafts and the server logs how to get it. `--drafter none` forces the
+> MTP head; the `-dflash` ids are aliases that require the drafter. docs/server.md 14.
+
+> **Correction (lab-dflfix, 23 Oct): the 19 Oct q-gate (13.2 simulation, 13.3, the gated rows of 13.4) was NOT
+> distribution-preserving** (same flaw as 11.4: k chosen from q(d_j) of the drawn drafts; e.g. q = p = (0.62, 0.38) at
+> position 2 gave output (0.856, 0.144), TV 0.24). The sampled-dist check of 13.5 only tested out[1], which is always
+> verified. Those gated speed numbers are invalid; section 13.9 has the exact gate, its proofs and the re-measurement.
 
 Inco's **Qwen3.8-Flash-Next-DFlash2** (huggingface incoai/Qwen3.8-Flash-Next-DFlash2 @ a22a1744e85c, Apache-2.0; 0.6B
 bf16, data only, downloaded to `~/.cache/ijah/drafters/Qwen3.8-Flash-Next-DFlash2`) as an alternative drafter in the MTP loop.
@@ -984,7 +1070,7 @@ k = 5 rounds (2-fold held-out calibration): **+9-14% over MTP d2** at a 1.0-2.5 
 
 ### 13.3 Engine implementation (`models/flash_next/dflash.{h,mm,metal}`, `mtp_loop.mm`)
 - Weights: the checkpoint mapped (`Pack::open`), matrices quantised at load to 8-bit MLX affine g64 (CPU, 0.6 s;
-  `NE`/server `--dflash-bits 4`: q / o / MLP at 4 bits — no faster, record_qn is ALU-bound), the codebooks read in
+  `--dflash-bits 4`: q / o / MLP at 4 bits — no faster, record_qn is ALU-bound), the codebooks read in
   place. GEMMs = `nax::record_q8` at <= 8 rows; small kernels: `dfl_rms`, `dfl_conv`, `dfl_qk_prep`, `dfl_attn` (8 KV
   heads x 16 key splits, online softmax, fixed-order `dfl_attn_reduce`), `dfl_select`. Readout = the loop's pruned
   4-bit draft head + `mtp_topk_local` / `mtp_shortlist` at K 16 (exact 8-bit re-score; the proposal is what is drawn,
@@ -1099,3 +1185,82 @@ read, nothing run or copied. Splash's DFlash2 port for the dense 27B (splash-m5 
 `DraftCheckpoint.cpp`, `runtime/metal/kernels/decode/draft.metal`, `sampling.metal` draft_select_*; this project's own
 work) fixed the reading of the convolution layout, the context K / V path and the selector; the kernels here are
 written for this engine's layouts.
+
+### 13.9 The exact gate and the re-measurement (lab-dflfix, 23 Oct)
+
+**The flaw.** Speculative sampling keeps p only if whether d_j is verified is fixed before d_j is drawn. The 19 Oct
+gates (DFlash2, and the opt-in MTP `NE_MTP_QGATE`) maximised E[tokens](k) / cost over k using q(d_j) of the drawn drafts:
+a verified d_j is speculative-sampled, a cut one is replaced by a fresh draw from p, and with the cut depending on d_j
+the mixture is not p (reviewer's case: q = p = (0.62, 0.38) at position 2 -> (0.856, 0.144), TV 0.24). Greedy rounds
+were fine (match accept). 13.5's sampled check tested out[1] only, which is always verified.
+
+**The fix (`mtp::gate_prefix`, mtp.h).** d_1 always; d_j (j >= 2) iff prod_{i<j} acc(q_i(d_i)) * E_j >= rate * (cost[j + 1] -
+cost[j]), E_j = sum_x q_j(x) acc(q_j(x)) (expected acceptance from q_j's distribution), stopping at the first exclusion;
+acc = P(accepted | q(d) bin) learned per run from outcomes, cost = fixed priors, rate = an EMA of tokens / prior cost (all
+deterministic). The MTP qgate uses it too; greedy DFlash rounds keep the lookahead rule. No lookahead over j + 1 for
+sampled rounds: q_{j+1} depends on d_j through the selector's edge term. (Splash 1.4.0 PR #487, incoai/splash,
+Apache-2.0, picks verify rows by expected tokens per cost from a confidence = the top candidate's probability, also a
+property of the distribution; a path-independent confidence, e.g. from the unary logits, would allow lookahead here
+too: a lead, not adopted.)
+
+**Proofs.** `mtp-accept-test`: 2e6 whole generations (rounds of 4 sampled drafts on a synthetic chain over 4 tokens, q =
+p on a quarter of the prefixes, the gate + `accept_sampled_p`) at two gate rates (verified prefixes 1-4 all exercised):
+the joint of the first 4 tokens chi2 261 / 276 (255 dof, 99.9% 341), worst marginal |z| 2.3 / 1.5; the 19 Oct rule
+chi2 158,611 (|z| 227): the test has the power. End to end (`test_sampled_dist.py --dflash DIR --pool 2000`: 2,000
+DFlash2 runs from an MTP snapshot vs 2,000 plain step-path samples from the same state, 7 tokens each): every position
+out[1..6] two-sample P 0.13-0.90, consecutive pairs P 0.18-0.81: OK.
+
+**Re-measurement (indicative: in-process, 1,024 tokens, 3 prompts x 1 seed, configs back to back per prompt).**
+
+| context | MTP d2 | DFlash2, exact gate | DFlash2, fixed k = 3 |
+|---|---|---|---|
+| short (code_lru, text_crisis, math_proof) | 100.5 tok/s, 2.45 tok/round | **108.8 (+8.3%; 1.099 / 1.074 / 1.074)**, 2.94 | 97.8 (-2.7%) |
+| ~8K (prose, code, web; lab-dflong's harness) | 101.9, 2.49 | 102.4 (1.003 [0.886, 1.134], 2 / 3), 2.83 | |
+| ~32K | 97.8, 2.42 | 97.6 (0.997 [0.922, 1.078], 1 / 3), 2.63 | |
+
+Long context: the block draft costs 2.6-2.7 ms (2.3 short: the window's 2,047 keys) and the extra tokens per round
+shrink: parity, so **past 8,192 context tokens the MTP head drafts** (`--dflash-max-ctx`, `NE_DFL_MAX_CTX`,
+`ne_fn_dfl_set_max_ctx`; no context upkeep there either). The 19 Oct same-client numbers (13.4) were the biased gate's
+and are not re-measured yet; the 19 Oct greedy numbers stand (exact).
+
+**Serving (also lab-dflfix).** The drafter belongs to the model id: server/models.json `"drafter"` (the `-dflash` ids,
+path `~/.cache/ijah/drafters/Qwen3.8-Flash-Next-DFlash2`; `--drafter-path` overrides;
+config.json + model.safetensors checked before any model loads); no process-wide `--drafter` / `NE_DRAFTER`. `--models
+all` leaves drafter ids out unless `--with-drafters`; a request for a `-dflash` id the server did not load is a 400 that
+names `--model-id`. Flags `--dflash-kmax` (1..5 in this build), `--dflash-bits`, `--dflash-block`, `--dflash-gate`,
+`--dflash-max-ctx`; `--mtp 5` is no longer needed. (Since v0.2 the plain ids carry the drafter and the `-dflash` ids are
+aliases: docs/server.md 14.) The chunked prefill's feature ring is the Prefill's own and written only
+while the drafter model's call sets its flag (a shared Prefill's other model used to overwrite rows); `ne_fn_dfl_set(..,
+active = 0)` drops the capture hooks; `NE_DFL_CAPTURE` removed. As in Splash: greedy / seeded outputs with the drafter can
+differ from the step path at bf16 ties (the verify width changes the rounding); runs with the same settings repeat.
+
+### 13.10 Lookahead gate over path-free confidences (lab-dfllook, 23 Oct; opt-in `--dflash-gate 2`)
+
+After Splash 1.4.0 PR #487 (incoai/splash, Apache-2.0: per-position confidence, online logistic refit, verify rows by
+expected tokens per cost). **Independence**: c_j = the top probability of softmax(logits / T) over block position j's 16
+readout logits (`s.sl`: the block forward's rows 1 .. B - 1 through the final norm, the pruned 4-bit head and the exact
+8-bit re-score in `mtp_shortlist`). The block's inputs are [anchor, mask ...] and the context, so `sl` is written before
+`dfl_select` runs, and `dfl_select` (the only place a draft is drawn) writes `vtok` / `qo` / `dr` and never `sl`. The
+selector's path-dependent edge term (pred_cb[d_{j-1}]) is not in c_j. So c_1 .. c_K, and the k chosen from them, depend on
+nothing drawn: any lookahead is exact. `mtp::gate_lookahead`: p_j = sigmoid(slope logit(c_j) + icpt[j]),
+k = argmax_k E(k) / cost[k + 1], E(k) = 1 + sum_{j<=k} prod_{i<=j} p_i; `mtp::AcceptFit` refits (IRLS, ridge 1 toward the
+current values) every 64 rounds on the last 4,096 (c, position, accepted) labels of verified positions, reset to priors
+(slope 1, icpt 0.6 / 0.5 / 0.4 / 0.4 / 0.3 ...) every run (runs repeat); cost = the fixed priors of 13.9 (deterministic;
+Splash fits a least-squares cost line).
+
+Checks: `mtp-accept-test` lookahead + online refit arm (confidences from the round start along q's argmax path, the
+p / q overlap there: predictive and draw-free): 2e6 generations, verified prefixes 1 / 2 / 3 / 4 all used, joint of 4 tokens
+chi2 249.8 (99.9% 341); the biased 19 Oct rule chi2 158,611; AcceptFit recovers known parameters (slope 1.72 / 1.7).
+`test_sampled_dist.py --dflash DIR --dflash-gate 2 --pool 2000`: out[1..6] P 0.05-0.88, pairs 0.05-0.75: OK.
+
+Indicative (in-process, 3 prompts x 1 seed x 1,024 tokens, back to back per prompt), tok/s:
+
+| context | MTP d2 | sequential gate (13.9, default) | lookahead gate |
+|---|---|---|---|
+| short (code_lru / text_crisis / math_proof) | 101.8 (107.9 / 87.7 / 109.7) | **108.2** (111.4 / 94.6 / 118.5) | 105.9 (103.3 / 90.1 / 124.5) |
+| ~8K (prose / code / web) | 100.3 | **103.0** | 102.1 |
+
+The lookahead wins on predictable text (math_proof +5% over sequential: 3.79 vs 3.37 tokens / round) and loses on the
+rest: the unary top probability predicts acceptance worse than q_j's own expected acceptance, which sees the
+selector's path. **Sequential stays the default**; the lookahead is opt-in. Leads: a confidence that also uses the
+path once it is drawn (sequential) combined with the lookahead's priors for the positions not yet drawn.

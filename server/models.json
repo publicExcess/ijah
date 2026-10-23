@@ -1,12 +1,22 @@
 {
- "_doc": "Model ids the server can serve (docs/server.md 1b). --model-id ID picks the first pack of ID's list that is complete; --pack DIR overrides. '@IJAH_PACKS/' = the packs directory (env IJAH_PACKS, default ~/.cache/ijah/packs); download a pack with: hf download SiliconSpecies/<name> --local-dir <IJAH_PACKS>/<name>. A pack with trunk6 metadata is complete when all 48 layers are converted and the bf16 mixer is in.",
- "default": "Qwen3.8-Flash-Next-native",
- "models": {
-  "Qwen3.8-Flash-Next-native": {"packs": ["@IJAH_PACKS/Qwen3.8-Flash-Next-EXL3-Ijah"]},
-  "Swift-1.5-Flash-Next-native": {"packs": ["@IJAH_PACKS/Swift-1.5-Flash-Next-EXL3-Ijah"]},
-  "Swift-1.5-Flash-Next-native-dflash": {
-   "packs": ["@IJAH_PACKS/Swift-1.5-Flash-Next-EXL3-Ijah"],
-   "_doc": "The same Swift-1.5 weights, served with the DFlash2 block drafter on (+7-10% decode, docs/mtp.md 13). The drafter is a server start flag, so it is a model id here: clients pick it with `model`. Start it with tools/serve.sh start -- --mtp 5 --drafter dflash2 --drafter-path ~/.cache/ijah/drafters/Qwen3.8-Flash-Next-DFlash2 (hf download incoai/Qwen3.8-Flash-Next-DFlash2 --local-dir that path). A server started without --drafter does not advertise this id, and a plain id on a drafter server is refused, so a drafter run and its control cannot be confused (docs/server.md 13). The drafter is Inco's Qwen3.8-Flash-Next-DFlash2 (Apache-2.0); it drafts Swift-1.5, the fine-tune of the same architecture."
+  "_doc": "Model ids the server can serve (docs/server.md 1b). --model-id ID picks the first pack of ID's list that is complete; --pack DIR overrides. '@IJAH_PACKS/' = the packs directory (env IJAH_PACKS, default ~/.cache/ijah/packs); download with tools/ijah download base|swift|base-4bit (or hf download SiliconSpecies/<name> --local-dir <IJAH_PACKS>/<name>). A pack with trunk6 metadata is complete when all 48 layers are converted and the bf16 mixer is in. 'drafter': the DFlash2 block drafter the id uses by default (docs/mtp.md 13; Inco's incoai/Qwen3.8-Flash-Next-DFlash2 @ a22a1744e85c, Apache-2.0, trained on the Qwen3.8 base; it drafts Swift-1.5 too): the first path ('@IJAH_DRAFTERS/' = IJAH_DRAFTERS, default ~/.cache/ijah/drafters) holding config.json + model.safetensors (--drafter-path overrides; tools/ijah download drafter); none there -> the MTP head drafts, with one log line; --drafter none (NE_DRAFTER=none) forces the MTP head. 'alias_of': an id that is another id with its drafter required (the -dflash ids, kept for clients configured before v0.2; a 400 when the server runs that model without the drafter). 'in_all': false keeps an id out of --models all.",
+  "default": "Qwen3.8-Flash-Next-native",
+  "models": {
+    "Qwen3.8-Flash-Next-native": {
+      "packs": ["@IJAH_PACKS/Qwen3.8-Flash-Next-EXL3-Ijah"],
+      "drafter": {"kind": "dflash2", "paths": ["@IJAH_DRAFTERS/Qwen3.8-Flash-Next-DFlash2"]}
+    },
+    "Swift-1.5-Flash-Next-native": {
+      "packs": ["@IJAH_PACKS/Swift-1.5-Flash-Next-EXL3-Ijah"],
+      "drafter": {"kind": "dflash2", "paths": ["@IJAH_DRAFTERS/Qwen3.8-Flash-Next-DFlash2"]}
+    },
+    "Qwen3.8-Flash-Next-native-4bit": {
+      "packs": ["@IJAH_PACKS/Qwen3.8-Flash-Next-EXL3-Ijah-4bit"],
+      "drafter": {"kind": "dflash2", "paths": ["@IJAH_DRAFTERS/Qwen3.8-Flash-Next-DFlash2"]},
+      "in_all": false,
+      "_doc": "SiliconSpecies/Qwen3.8-Flash-Next-EXL3-Ijah-4bit: the T6 pack with Sushi-4bpw's 4-bit routed experts; faster, lower fidelity (the T6 pack is preferred). Its experts differ from T6's, so it shares nothing with the other ids: not in --models all."
+    },
+    "Qwen3.8-Flash-Next-native-dflash": {"alias_of": "Qwen3.8-Flash-Next-native"},
+    "Swift-1.5-Flash-Next-native-dflash": {"alias_of": "Swift-1.5-Flash-Next-native"}
   }
- }
 }

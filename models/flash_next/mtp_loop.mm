@@ -104,9 +104,17 @@ struct MtpLoop {
     int fsT = 0, fsn = 0, vcnt = 0;
     uint64_t gen = ~0ull;
     int B = 8, kmax = 5, kgreedy = 3, minctx = 512;
-    bool gate = true, active = true, early_a = true;  // early_a: NE_DFL_EARLY_A (A behind the draft, see the round)  // active = 0: no block drafts and no context upkeep (A/B in one process)
+    int gate = 1;  // 0: kmax drafts; 1: the exact sequential gate (13.9); 2: lookahead over path-free confidences (13.10)
+    bool active = true, early_a = true, capped = false;
+    mtp::AcceptFit fit;  // gate 2: logit(P accept) = slope logit(conf) + icpt[position], refit online (reset per run)
+    int maxctx = 8192;  // NE_DFL_MAX_CTX / ne_fn_dfl_set_max_ctx: no block drafts past this many context tokens  // early_a: NE_DFL_EARLY_A (A behind the draft, see the round)  // active = 0: no block drafts and no context upkeep (A/B in one process)
     double qacc[10], qaccg[10], rc = 3.0, rm = 25.0, vcost[9], vcostg[9];  // (..g: greedy rounds)
-    double qacc0[10], vcost0[9];  // the priors: every run starts from them (runs repeat exactly, as DepthPolicy's)
+    double qacc0[10], vcost0[9];
+    // lab-moegroup: the gate's cost table (dfl_costs): 0 per-pair rounds (default: the grouped table made the gate verify
+    // 3.94 rows per round instead of 3.73 at parity, -0.5 / -1.2% in-process on T6 / K4s; docs/mtp.md 12.8), 1 grouped,
+    // -1 by the MoE path
+    int vc_mode = 0;
+    double rate = 0.11;  // tokens per ms of sampled block rounds (EMA of c / cost[R]: outcomes only, deterministic)  // the priors: every run starts from them (runs repeat exactly, as DepthPolicy's)
   };
   std::unique_ptr<Dfl> dfl;
   int last_dfl_rounds = 0, last_dfl_tokens = 0;
@@ -130,17 +138,14 @@ static void ctx_add(MtpLoop &L, int T, const int *t, int n) {
   L.ctx.insert(L.ctx.end(), t, t + n);
 }
 static int qbin(double qd) { return std::clamp((int)(qd * 10.0), 0, 9); }
+// lab-dflfix: the exact sequential rule (mtp::gate_prefix; docs/mtp.md 13.9). The 18 Oct rule maximised over k
+// with q(d_j) of every drawn draft, i.e. whether d_j was verified depended on d_j: not distribution-preserving.
 static int qgate_depth(MtpLoop &L, const int *drafts, const mtp::Dist *q, int Dd) {
-  const double rate = L.qrc / L.qrm;
-  int best = 1;
-  double run = 1.0, e = 1.0, bv = -1e30;
-  for (int k = 1; k <= Dd; k++) {
-    run *= L.qacc[qbin(q[k - 1].prob(drafts[k - 1]))];
-    e += run;
-    const double v = e - rate * L.vcost[k + 1];
-    if (v > bv) { bv = v; best = k; }
-  }
-  return best;
+  mtp::GateParams g;
+  g.acc = L.qacc;
+  g.cost = L.vcost;
+  g.rate = L.qrc / L.qrm;
+  return mtp::gate_prefix(q, drafts, Dd, g);
 }
 static void qgate_observe(MtpLoop &L, const int *drafts, const mtp::Dist *q, int D, int a, int R, double round_ms,
                           int c) {
@@ -212,7 +217,6 @@ MtpLoopPtr mtp_create(Model &m, int max_depth, int draft_bits, int shortlist) {
   L->dsp = alloc(DType::U32, {8});
   L->xind = alloc(DType::U32, {4});
   L->feat = alloc(DType::F32, {RM, 5 * HID});
-  if (const char *e = getenv("NE_DFL_CAPTURE")) L->dfl_cap = atoi(e) > 0;
   for (auto &w : m.L) L->ex.push_back(w.linear ? nax::alloc_layer_extra(0, true, &L->keep) : nax::alloc_layer_extra());
   L->mixer = m.mixer;
   L->mixer.inject = m.dummy_inj;
@@ -372,10 +376,18 @@ static Recorder &get_draft(MtpLoop &L, int n, int D, bool sampled) {
 
 
 // ---- lab-dflash: the DFlash2 drafter's context (docs/mtp.md 13)
-static bool dfl_on(const MtpLoop &L) { return L.dfl && L.dfl->active; }
+// active and not capped (lab-dflfix: above maxctx tokens of context the drafter does not pay -- 8K / 32K were parity,
+// docs/mtp.md 13.9 -- so rounds use the MTP head and the context upkeep stops until a run starts below the cap again)
+static bool dfl_on(const MtpLoop &L) { return L.dfl && L.dfl->active && !L.dfl->capped; }
+// the context restarts at T when stale (and, if capped, only once T is below the cap again)
+static void dfl_reset(MtpLoop &L, int T);
+static void dfl_sync(MtpLoop &L, int T) {
+  if (L.dfl && L.dfl->active && L.dfl->gen != L.m->gen && T <= L.dfl->maxctx) dfl_reset(L, T);
+}
 static void dfl_reset(MtpLoop &L, int T) {
   if (!L.dfl) return;
   MtpLoop::Dfl &d = *L.dfl;
+  d.capped = false;
   d.c.T = T;
   d.c.n = 0;
   d.fsT = T;
@@ -502,10 +514,12 @@ static void dfl_import(MtpLoop &L, const void *buf) {
     dfl_rebuild_rec(L).run();
   }
 }
-static int dfl_gate_depth(const MtpLoop::Dfl &d, const float *qd, int K, bool greedy) {
+// GREEDY rounds only (their accept is a match, so any rule is exact): the k maximising E[tokens](k) / cost(k + 1) from
+// the selector's confidence at each argmax draft. Sampled rounds use the exact mtp::gate_prefix (lab-dflfix).
+static int dfl_gate_greedy(const MtpLoop::Dfl &d, const float *qd, int K) {
   int best = 1;
   double bv = -1.0, run = 1.0, e = 1.0;
-  const double *acc = greedy ? d.qaccg : d.qacc, *vc = greedy ? d.vcostg : d.vcost;
+  const double *acc = d.qaccg, *vc = d.vcostg;
   for (int k = 1; k <= K; k++) {
     run *= acc[qbin(qd[k - 1])];
     e += run;
@@ -620,9 +634,24 @@ static void feed_body(MtpLoop &L, const int *toks, int n, bool chunk_policy, con
       // the next chunk's n-gram rows are gathered while this one runs (within the call: prefill_tokens' own
       // overlap; the call's last chunk: the caller's `ahead`, the next call's first tokens)
       const bool last = i + cn >= n;
-      if (dfl_on(L)) prefill_set_dfl(pf, &L.dfl->fs);  // (a shared Prefill may have been swapped in: lab-srvperf)
-      prefill_tokens(pf, toks + i, cn, last ? ahead : toks + i + cn, last ? n_ahead : n - i - cn);
-      if (dfl_on(L)) dfl_note(L, m.T - cn, cn);
+      // lab-dflfix: the Prefill (possibly shared with other models: lab-srvperf) captures into its own ring only during
+      // this call; the drafter's rows are copied out right after
+      const Tensor *ring = dfl_on(L) ? &prefill_dfl_ring(pf) : nullptr;
+      if (ring) prefill_dfl_capture(pf, true);
+      try {
+        prefill_tokens(pf, toks + i, cn, last ? ahead : toks + i + cn, last ? n_ahead : n - i - cn);
+      } catch (...) {
+        if (ring) prefill_dfl_capture(pf, false);
+        throw;
+      }
+      if (ring) {
+        prefill_dfl_capture(pf, false);
+        const int nr = std::min(cn, dfl::W);
+        for (int pos = m.T - nr; pos < m.T; pos++)
+          memcpy((float *)L.dfl->fs.host() + (size_t)(pos % dfl::W) * dfl::FEAT,
+                 (const float *)ring->host() + (size_t)(pos % dfl::W) * dfl::FEAT, (size_t)dfl::FEAT * 4);
+        dfl_note(L, m.T - cn, cn);
+      }
       const auto f1 = clk::now();
       int r0 = 0;
       if (hchunk) {
@@ -679,7 +708,7 @@ void mtp_feed(MtpLoop &L, const int *toks, int n, const int *ahead, int n_ahead)
   NE_CHECK(htmax == 0 || L.m->T + n <= htmax, "mtp_feed: the MTP head's context is full (%d + %d > %d)", L.m->T, n, htmax);
   NE_CHECK(mtp_head_ok(L), "mtp_feed: the MTP head is not in step with the model (plain step / prefill / restore "
                            "since its last MTP call): reset or restore an MTP snapshot");
-  if (dfl_on(L) && L.dfl->gen != L.m->gen) dfl_reset(L, L.m->T);
+  dfl_sync(L, L.m->T);
   feed_body(L, toks, n, use_chunked(*L.m, n), ahead, n_ahead);
   L.head_gen = L.m->gen;
   if (dfl_on(L)) {
@@ -693,7 +722,7 @@ StepOut mtp_step(MtpLoop &L, int tok, bool head) {
   NE_CHECK(mtp_head_ok(L), "mtp_step: the MTP head is not in step with the model");
   head_next(L, tok);
   ctx_add(L, m.T, &tok, 1);
-  if (dfl_on(L) && L.dfl->gen != m.gen) dfl_reset(L, m.T);
+  dfl_sync(L, m.T);
   StepOut o = step(m, tok, head);
   head_pend(L, (const float *)m.h[m.L.size() % 2].host(), -1);
   head_lazy(L);
@@ -764,13 +793,16 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
   NE_CHECK(m.T + n + 1 <= m.tmax, "context full (%d + %d of %d)", m.T, n, m.tmax);
   u32(L.keep)[0] = 0;
   L.head_ms = 0;
-  if (dfl_on(L) && L.dfl->gen != m.gen) dfl_reset(L, m.T);  // (a fresh run: T = 0; a stale context: from T on)
+  dfl_sync(L, m.T);  // (a fresh run: T = 0; a stale context: from T on)
   if (dfl_on(L)) {  // the gate's calibration starts from the priors in every run (a run's rounds depend on it only)
     MtpLoop::Dfl &d = *L.dfl;
     memcpy(d.qacc, d.qacc0, sizeof d.qacc);
     memcpy(d.qaccg, d.qacc0, sizeof d.qaccg);
     memcpy(d.vcost, d.vcost0, sizeof d.vcost);
     memcpy(d.vcostg, d.vcost0, sizeof d.vcostg);
+    d.rate = 0.11;
+    { const double i0[8] = {0.6, 0.5, 0.4, 0.4, 0.3, 0.3, 0.3, 0.3};  // priors (lab-dfllook): about the 13.4 acceptances
+      d.fit.reset(1.0, i0); }
   }
 
   // ---- prefill: the target over prompt[0, n - 1) (chunked prefill from 16 tokens, else 4-row chunks + 1-row steps);
@@ -789,6 +821,10 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
   out[0] = o.token;
   const bool cb_stop = cb && cb(cb_ctx, out, 1);
   head_drain(L, true, 1);  // every pair but the seed (H_{T-1}, t1) into the head's KV
+  if (dfl_on(L) && m.T > L.dfl->maxctx) {  // lab-dflfix: past the cap: the MTP head drafts, no upkeep
+    L.dfl->capped = true;
+    L.dfl->gen = ~0ull;
+  }
   if (dfl_on(L)) dfl_drain(L);  // lab-dflash: the prompt's last <= 2048 feature rows into the drafter's context
   S.prefill_ms = ms_since(t0);
   S.head_prefill_ms = L.head_ms;
@@ -821,6 +857,11 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
   int copy_buf[16];
   double drain_ms = 0;
   while (!done) {
+    if (dfl_on(L) && T > L.dfl->maxctx) {  // lab-dflfix: the run grew past the cap
+      dfl_flush_v(L, true);
+      L.dfl->capped = true;
+      L.dfl->gen = ~0ull;
+    }
     int D = depth ? depth : pol.next_depth();
     // copy rule: a verbatim continuation of an earlier occurrence of the last copy_min tokens (one-hot drafts)
     int nc = L.copy_min > 0 ? copy_find(L, t1, L.copy_maxd, copy_buf) : 0;
@@ -870,6 +911,7 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
     if (dfl_on(L) && !dround) dfl_flush_v(L, false);
     double dgpu_d = 0;
     mtp::Dist dq[8];
+    double dconf[8] = {};   // lab-dfllook: path-free confidences of the block positions
     float dqd[8] = {};      // lab-dflash: q(d_j) of the block's drafts (greedy: the selector's softmax at the argmax)
     Recorder *ap = nullptr;  // lab-dflash: A committed behind the block draft at kmax + 1 rows (B then runs at R <= that)
     if (copy) {
@@ -916,7 +958,32 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
           if ((int)id == dj) qd[j] = pr;
         }
       }
-      const int kd = !d.gate ? (greedy ? std::min(d.kmax, d.kgreedy) : d.kmax) : dfl_gate_depth(d, qd, d.kmax, greedy);
+      // lab-dfllook: c_j = the top probability of position j's unary readout, softmax(logits / temp) over the 16 exact
+      // logits of the block forward's readout (s.sl): computed before the selector, so before any draft is drawn
+      {
+        const float *sl = (const float *)d.s.sl.host();
+        const double tmp = greedy ? 1.0 : m.P.temp;
+        for (int j = 0; j < Pn; j++) {
+          double mx = -1e30, z = 0;
+          for (int c2 = 0; c2 < dfl::NC; c2++) mx = std::max(mx, (double)sl[(j * dfl::NC + c2) * 2 + 1]);
+          for (int c2 = 0; c2 < dfl::NC; c2++) z += std::exp(((double)sl[(j * dfl::NC + c2) * 2 + 1] - mx) / tmp);
+          dconf[j] = 1.0 / z;
+        }
+      }
+      int kd = greedy ? std::min(d.kmax, d.kgreedy) : d.kmax;
+      if (d.gate && greedy) {
+        kd = dfl_gate_greedy(d, qd, d.kmax);
+      } else if (d.gate == 2) {  // exact: k from confidences fixed before any draw (lab-dfllook, docs/mtp.md 13.10)
+        kd = mtp::gate_lookahead(dconf, d.kmax, d.fit, d.vcost);
+      } else if (d.gate) {  // exact: d_j's inclusion from d_<j and q_j's distribution only (mtp::gate_prefix)
+        int dr8[8];
+        for (int j = 0; j < Pn; j++) dr8[j] = (int)u32(d.s.dr)[j];
+        mtp::GateParams g;
+        g.acc = d.qacc;
+        g.cost = d.vcost;
+        g.rate = d.rate;
+        kd = mtp::gate_prefix(dq, dr8, d.kmax, g);
+      }
       for (int j = 0; j < Pn; j++) dqd[j] = qd[j];
       D = std::max(1, std::min(kd, m.tmax - T - 3));
       arm(D);
@@ -1065,12 +1132,15 @@ static int generate_impl(MtpLoop &L, bool fresh, const int *prompt, int n, int m
       for (int j = 0; j < D && j <= a; j++) {
         double &x = (greedy ? d.qaccg : d.qacc)[qbin(dqd[j])];
         x = 0.97 * x + 0.03 * (j < a ? 1.0 : 0.0);
+        if (!greedy) d.fit.add(dconf[j], j, j < a);  // lab-dfllook: the lookahead gate's labels (verified positions)
       }
+      if (!greedy) d.fit.round_done();
       // (round costs stay the measured priors: learning them from wall time made a run's rounds depend on timing,
       // so runs did not repeat; NE_DFL_COST_EMA=1 learns them anyway)
       static const bool cost_ema = getenv("NE_DFL_COST_EMA") && atoi(getenv("NE_DFL_COST_EMA")) > 0;
       double *vc = greedy ? d.vcostg : d.vcost;
       if (cost_ema && R < 9) vc[R] = 0.9 * vc[R] + 0.1 * (wall + host_pre / 1e3);
+      if (!greedy && R < 9) d.rate = 0.95 * d.rate + 0.05 * c / vc[R];
     } else if (!gate) {
       pol.observe(D, a, wall);
     }
@@ -1447,18 +1517,30 @@ NE_API int ne_fn_dfl_commit(ne_fn_mtp *p, const int *toks, int c) {
 // lab-dflash: the DFlash2 drafter on (dir = the checkpoint) with B block rows, at most kmax drafts verified (the q-gate
 // picks 1 .. kmax per sampled round), drafter weights at `bits` (8 / 4). Re-records the verifies (feature capture) and
 // the model's step recordings; resets the model.
+// The gate's round ms by verify rows R (draft + A + B + host; T6 pack, in-loop): the per-(row, slot) MoE's (19 Oct,
+// docs/mtp.md 13; re-measured 23 Oct: 20.1 / 24.0 / 27.5 / 30.7 / 34.0 / 37.2 / 40.2 at R 2-8) or, with the grouped
+// routed experts (lab-moegroup, docs/mtp.md 12.8), 23 Oct's grouped rounds. vc_mode 0 / 1 forced, -1 = by g_moe_group.
+static void dfl_costs(MtpLoop &L, MtpLoop::Dfl &d) {
+  static const double vc_pair[9] = {14.0, 14.5, 20.2, 23.9, 27.3, 31.6, 34.4, 37.5, 40.5};
+  static const double vc_group[9] = {14.0, 14.5, 19.7, 23.2, 25.7, 28.1, 30.7, 33.1, 35.2};
+  const bool grp = d.vc_mode >= 0 ? d.vc_mode == 1 : (g_moe_group > 0 && L.m->L[0].t6);
+  const double *vc = grp ? vc_group : vc_pair;
+  for (int R = 0; R < 9; R++) d.vcost[R] = d.vcostg[R] = d.vcost0[R] = vc[R];
+}
 static void dfl_enable(MtpLoop &L, const std::string &dir, int B, int kmax, int bits, int gate) {
   Model &m = *L.m;
   auto d = std::make_unique<MtpLoop::Dfl>();
   d->w = dfl::load(dir, bits);
   NE_CHECK(B >= 2 && B <= dfl::RMAX, "dflash block %d (2..8)", B);
+  NE_CHECK(kmax >= 1 && kmax <= 7, "dflash kmax %d (1..7: the loop's max depth is <= 7)", kmax);
   d->B = B;
   d->kmax = std::max(1, std::min({kmax, B - 1, L.maxd}));
   d->kgreedy = std::min(d->kmax, 3);
   if (const char *e = getenv("NE_DFL_KGREEDY")) d->kgreedy = std::clamp(atoi(e), 1, d->kmax);
   if (const char *e = getenv("NE_DFL_MIN_CTX")) d->minctx = std::max(0, atoi(e));
   if (const char *e = getenv("NE_DFL_EARLY_A")) d->early_a = atoi(e) > 0;
-  d->gate = gate != 0;
+  if (const char *e = getenv("NE_DFL_MAX_CTX")) d->maxctx = std::max(0, atoi(e));
+  d->gate = std::clamp(gate, 0, 2);
   d->c = dfl::alloc_ctx();
   d->s = dfl::alloc_scratch(B);
   for (int i = 0; i < dfl::RMAX; i++) u32(d->s.tok)[i] = (uint32_t)d->w.mask;
@@ -1467,9 +1549,7 @@ static void dfl_enable(MtpLoop &L, const std::string &dir, int B, int kmax, int 
   // acceptance by q(d) bin, priors measured on the h2h prompts (docs/mtp.md 13); round ms by verify rows
   const double pri[10] = {0.22, 0.37, 0.40, 0.48, 0.52, 0.48, 0.58, 0.57, 0.71, 0.93};
   for (int b = 0; b < 10; b++) d->qacc[b] = d->qaccg[b] = d->qacc0[b] = pri[b];
-  // round ms by verify rows (draft + A + B + host; in-loop 19 Oct, docs/mtp.md 13)
-  const double vc[9] = {14.0, 14.5, 20.2, 23.9, 27.3, 31.6, 34.4, 37.5, 40.5};
-  for (int R = 0; R < 9; R++) d->vcost[R] = d->vcostg[R] = d->vcost0[R] = vc[R];
+  dfl_costs(L, *d);
   d->draft = std::make_unique<Recorder>();
   d->draft->begin();
   dfl::record_ctx_rows(*d->draft, d->w, d->c, d->s, L.feat, 8, 0);
@@ -1482,7 +1562,7 @@ static void dfl_enable(MtpLoop &L, const std::string &dir, int B, int kmax, int 
   L.dfl = std::move(d);
   L.dfl_cap = true;
   set_dfl_capture(m, true);
-  prefill_set_dfl(chunked(m), &L.dfl->fs);
+  prefill_dfl_ring(chunked(m));
   rerecord_verifies(L);  // (resets the model)
   {  // first replays now (pipelines, residency), an empty context
     MtpLoop::Dfl &x = *L.dfl;
@@ -1512,10 +1592,29 @@ NE_API int ne_fn_dfl_set(ne_fn_mtp *p, int gate, int kmax, int active) {
     if (active >= 0 && d.active != (active != 0)) {
       d.active = active != 0;
       d.gen = ~0ull;  // its context restarts with the next feed / run
+      // lab-dflfix: no feature capture while inactive (the steps' and the verifies' hooks re-recorded; resets the model)
+      set_dfl_capture(*p->p->m, d.active);
+      p->p->dfl_cap = d.active;
+      rerecord_verifies(*p->p);
     }
-    if (gate >= 0) d.gate = gate != 0;
+    if (gate >= 0) d.gate = std::clamp(gate, 0, 2);
     if (kmax > 0) d.kmax = std::max(1, std::min({kmax, d.B - 1, p->p->maxd}));
     d.kgreedy = std::min(d.kgreedy, d.kmax);
+  });
+}
+// lab-moegroup: the gate's round-cost table: 0 = per-pair rounds (default), 1 = grouped rounds, -1 = by the MoE path
+NE_API int ne_fn_dfl_set_vcost(ne_fn_mtp *p, int mode) {
+  return c_call([&] {
+    NE_CHECK(p && p->p->dfl && mode >= -1 && mode <= 1, "bad arguments");
+    p->p->dfl->vc_mode = mode;
+    dfl_costs(*p->p, *p->p->dfl);
+  });
+}
+// lab-dflfix: no block drafts (and no context upkeep) past this many tokens of context (default 8192)
+NE_API int ne_fn_dfl_set_max_ctx(ne_fn_mtp *p, int maxctx) {
+  return c_call([&] {
+    NE_CHECK(p && p->p->dfl && maxctx >= 0, "bad arguments");
+    p->p->dfl->maxctx = maxctx;
   });
 }
 NE_API int ne_fn_dfl_on(ne_fn_mtp *p) { return p && p->p->dfl ? 1 : 0; }
@@ -1583,6 +1682,17 @@ NE_API int ne_fn_mtp_set_moe_split(ne_fn_mtp *p, int on) {
     if (g_moe_split == (on > 0)) return;
     g_moe_split = on > 0;
     rerecord_verifies(*p->p);
+  });
+}
+// lab-moegroup: grouped routed experts (g_moe_group) from min_rows rows on (0 off); re-records the verifies
+NE_API int ne_fn_mtp_set_moe_group(ne_fn_mtp *p, int min_rows) {
+  return c_call([&] {
+    NE_CHECK(p, "null argument");
+    const int v = min_rows <= 0 ? 0 : std::max(2, min_rows);
+    if (g_moe_group == v) return;
+    g_moe_group = v;
+    rerecord_verifies(*p->p);
+    if (p->p->dfl) dfl_costs(*p->p, *p->p->dfl);
   });
 }
 NE_API int ne_fn_mtp_set_draft_vocab(ne_fn_mtp *p, const char *mode) {

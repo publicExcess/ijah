@@ -97,6 +97,8 @@ if [ -n "${NEED_GB:-}" ]; then   # the previous holder's memory can take a momen
   fi
 fi
 echo go > $GO
+# kill the job and every descendant (a wrapping zsh/python would otherwise leave its children running outside the lock)
+killtree() { local c; for c in $(pgrep -P $1); do killtree $c; done; kill $1 2>/dev/null; }
 SW0=$(swapouts)
 (
   low=0; hist=()
@@ -104,7 +106,7 @@ SW0=$(swapouts)
     f=$(${=MEMP} 2>/dev/null | sed -n 's/.*free percentage: \([0-9]*\)%.*/\1/p')
     if [ -n "$f" ] && [ "$f" -lt $MINF ]; then
       low=$((low + 1))
-      if [ $low -ge $MINSAMP ]; then echo "with_lock: free RAM $f% < $MINF%, killing $P" >&2; kill $P; fi
+      if [ $low -ge $MINSAMP ]; then echo "with_lock: free RAM $f% < $MINF%, killing $P" >&2; killtree $P; fi
     else
       low=0
     fi
@@ -117,7 +119,7 @@ SW0=$(swapouts)
         base=${hist[1]#*:}; over="within ~${SWWIN} s"
       fi
       if [ $(( (sw - base) * 16 / 1024 )) -gt $MAXSW ]; then
-        echo "with_lock: swapouts +$(( (sw - base) * 16 / 1024 )) MB $over > $MAXSW MB, killing $P" >&2; kill $P
+        echo "with_lock: swapouts +$(( (sw - base) * 16 / 1024 )) MB $over > $MAXSW MB, killing $P" >&2; killtree $P
       fi
     fi
     sleep $POLL

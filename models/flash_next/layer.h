@@ -144,6 +144,18 @@ extern int g_moe_dedupe;
 // row through the (row, slot) kernel, the others once for all their rows (dedupe kernel), down per (row, slot)
 extern bool g_moe_split;
 bool moe_split(int R, const LayerW &w);
+// lab-moegroup: routed experts grouped by expert (T6 layers, R >= 2): each touched expert read once per tile of <= 4
+// rows (fn_moe_gateup_g / fn_moe_down_g, tiles of 1 / 2 / 4 rows built by the router's finisher), per-row arithmetic =
+// the per-(row, slot) kernels' (bit-identical). g_moe_group = the least R it runs at (default 2; env NE_FN_MOE_GROUP=0 = the old per-pair /
+// dedupe paths, exactly).
+extern int g_moe_group;
+extern int g_moe_spread;  // fn-prof only (NE_PROF_SPREAD): % of synthetic rows' slots re-routed (0 = real routing)
+extern bool g_moe_group_ind;  // live tiles only on indirect grids (default; NE_FN_MOE_GROUP_IND=0 = full grids)
+bool moe_group(int R, const LayerW &w);
+// router finisher mode: 0 none, 1 lab-verify's split lists, 2 lab-moegroup's tiles
+uint32_t moe_lists(int R, const LayerW &w);
+// the grouped routed passes: gate / up (3 dispatches, no barrier between) and down + HC write (3 dispatches)
+void record_moe_group(Recorder &r, Stage stage, const LayerW &w, Scratch &s, const Tensor &h_out);
 // HC read v2 (lab-speed's fn_hc_pre3 + fn_hc_mix2, kernels/fn_rec.h: no atomics, -0.30 ms per decode step; default;
 // env NE_FN_HC=v1 = fn_hc_pre + fn_hc_mix). hc_v2(R): used at R rows (not at R = 8, where nax::record_layer still
 // splits fn_hc_pre into 2 x 4 rows; the mix must match the pre). Read when a layer is recorded.

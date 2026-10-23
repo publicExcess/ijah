@@ -19,6 +19,7 @@ constant constexpr uint TPS = 2u;  // D2 output tiles per threadgroup
 constant constexpr uint KS = 2u;   // D3 k splits
 constant constexpr uint NRT = (NE + 1u + 7u) / 8u;  // router threadgroups (8 rows each over NE + 1 rows)
 constant constexpr uint NST = 2u * INTER / 8u;      // shared gate/up threadgroups
+constant constexpr uint OTG_ = 40u / TPS;           // (= OTG below: gate/up output tile groups per (expert, proj))
 
 // ------------------------------------------------------------------------------------------------ D1
 // grid NRT + NST threadgroups, 256 threads. x [R][HID]; logits [R][NE + 1]; gush [R][2 INTER]; route [R][20].
@@ -109,6 +110,24 @@ kernel void fn_moe_router(device const float *x [[buffer(0)]], device const usho
       // softmax over all 512 then top-k renormalised == softmax over the top-k logits
       const float p = lane < TOPK ? exp(myv - top) : 0.0f;
       const float s = simd_sum(p);
+      // lab-moegroup (fn-prof only): split bits 8-15 = a percentage of rows 1.. R-1's slots moved to other experts (the
+      // synthetic rows route alike; this sets their overlap to real text's); 0 in every engine recording
+      // (a moved slot that lands on an expert the row already uses stays: a row's 10 experts stay distinct, as the
+      // dedupe kernels' slot nibbles need)
+      const uint spread = (split >> 8u) & 0xFFu;
+      if (spread != 0u && t > 0u) {
+        const bool mv = lane < TOPK && ((t * 7919u + lane * 104729u + (myi & 63u) * 31u) % 100u) < spread;
+        uint f = mv ? (myi + 97u * t + 13u * lane + 1u) & (NE - 1u) : myi;
+        for (uint pass = 0u; pass < 3u; pass++) {
+          bool clash = false;
+          for (uint j = 0u; j < TOPK; j++) {
+            const uint fj = simd_shuffle(f, (ushort)j);
+            clash = clash || (j != lane && fj == f);
+          }
+          if (mv && clash) f = myi;
+        }
+        myi = f;
+      }
       if (lane < TOPK) { route[t * 20u + lane] = myi & (NE - 1u); route[t * 20u + TOPK + lane] = as_type<uint>(p / s); }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -148,7 +167,7 @@ kernel void fn_moe_router(device const float *x [[buffer(0)]], device const usho
     // rows that do not use expert u: score 0 (never read: their slot nibble is 0xF)
     // lab-verify split lists at X = uq + 1 + R TOPK (2 + R): [ns, nm, singles: es of experts used by one row [R TOPK],
     // multis: u of experts used by >= 2 rows [R TOPK]] (fn_moe_gateup_s / fn_moe_gateup_m, NE_FN_MOE_SPLIT)
-    if (split != 0u) {  // (only when the split kernels run: a constant, so the barriers stay uniform)
+    if ((split & 0xFFu) != 0u) {  // (only when the split kernels run: a constant, so the barriers stay uniform)
     if (i < R * TOPK) {
       uint c = 0u;
       for (uint j = 0u; j < R * TOPK; j++) c += (ulead[j] == lead) ? 1u : 0u;
@@ -156,6 +175,49 @@ kernel void fn_moe_router(device const float *x [[buffer(0)]], device const usho
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device uint *X = uq + 1u + R * TOPK * (2u + R);
+    if ((split & 0xFFu) == 2u) {  // lab-moegroup: per-expert tiles of <= 4 rows (fn_moe_gateup_g / fn_moe_down_g; layout there)
+      device uint *G = X + 2u + 2u * R * TOPK;
+      // tiles of expert lead j with c rows: c / 4 tiles of 4, then the remainder c % 4 (1 -> class 0, 2 -> class 1,
+      // 3 -> class 2 padded); classes count in leader order
+      if (i < R * TOPK) {
+        uint p1 = 0u, p2 = 0u, p4 = 0u, rank = 0u;
+        for (uint j = 0u; j < lead; j++) {
+          if (ulead[j] != j) continue;
+          const uint c = ucnt[j], rm = c % 4u;
+          p4 += c / 4u + (rm == 3u ? 1u : 0u);
+          p2 += rm == 2u ? 1u : 0u;
+          p1 += rm == 1u ? 1u : 0u;
+        }
+        for (uint j = lead; j < i; j++) rank += ulead[j] == lead ? 1u : 0u;
+        const uint c = ucnt[i], full = c / 4u, rm = c % 4u, t = rank / 4u, pos = rank % 4u;
+        const uint es = r * TOPK + k;
+        if (t < full) G[4u + 2u * R * TOPK + (p4 + t) * 4u + pos] = es;
+        else if (rm == 1u) G[4u + p1] = es;
+        else if (rm == 2u) G[4u + R * TOPK + p2 * 2u + pos] = es;
+        else {
+          G[4u + 2u * R * TOPK + (p4 + full) * 4u + pos] = es;
+          if (pos == 0u) G[4u + 2u * R * TOPK + (p4 + full) * 4u + 3u] = 0xFFFFFFFFu;
+        }
+      }
+      if (i == 0u) {
+        uint n1 = 0u, n2 = 0u, n4 = 0u;
+        for (uint j = 0u; j < R * TOPK; j++) {
+          if (ulead[j] != j) continue;
+          const uint c = ucnt[j], rm = c % 4u;
+          n4 += c / 4u + (rm == 3u ? 1u : 0u);
+          n2 += rm == 2u ? 1u : 0u;
+          n1 += rm == 1u ? 1u : 0u;
+        }
+        G[0] = n1; G[1] = n2; G[2] = n4;
+        // the six passes' threadgroup counts (MTLDispatchThreadgroupsIndirectArguments) after the tiles: live tiles only
+        device uint *A = G + 4u + 4u * R * TOPK;
+        const uint nt[3] = {n1, n2, n4};
+        for (uint c = 0u; c < 3u; c++) {
+          A[3u * c] = max(nt[c] * 2u * OTG_, 1u); A[3u * c + 1u] = 1u; A[3u * c + 2u] = 1u;
+          A[9u + 3u * c] = max(nt[c] * (HID / 128u), 1u); A[9u + 3u * c + 1u] = 1u; A[9u + 3u * c + 2u] = 1u;
+        }
+      }
+    } else {
     if (i < R * TOPK) {
       if (ucnt[i] == 1u) {
         uint p = 0u;
@@ -172,6 +234,7 @@ kernel void fn_moe_router(device const float *x [[buffer(0)]], device const usho
       for (uint j = 0u; j < R * TOPK; j++) { ns += (ucnt[j] == 1u) ? 1u : 0u; nm += (ulead[j] == j && ucnt[j] > 1u) ? 1u : 0u; }
       X[0] = ns;
       X[1] = nm;
+    }
     }
     threadgroup_barrier(mem_flags::mem_device);
     }
@@ -610,6 +673,216 @@ kernel void fn_moe_down_u(device const float *guo [[buffer(0)]], device const ui
   }
 }
 
+
+// ------------------------------------------------------------------------------------------------ D2, D3 grouped
+// lab-moegroup: the routed experts of an R-row step grouped by expert, so each touched expert's weights are read once
+// per tile of <= M rows (M = 1, 2, 4) instead of once per (row, slot) pair. The router's finisher (split == 2) writes
+// the tiles at G = uq + 1 + R TOPK (2 + R) + 2 + 2 R TOPK: G[0..2] = tile counts of M = 1 / 2 / 4, then the tiles of
+// class c (c = 0 / 1 / 2) at G + 4 + c R TOPK, M entries es = row * TOPK + slot each (0xFFFFFFFF = padding, M = 4
+// with 3 rows). An expert used by c rows: c / 4 tiles of 4 (+ one tile of the remainder: 1 -> M 1, 2 -> M 2, 3 ->
+// M 4 padded). Splash 1.4 (incoai/splash, Apache-2.0, PRs #454-#456) groups its MoE rows into per-expert tiles the
+// same way and runs small tiles as column GEMVs; this is our GEMV kernels' version of that idea.
+// Per row the arithmetic is fn_moe_gateup's / fn_moe_down's (the same prep, each simdgroup the same k tiles in the
+// same order, the same reductions and finisher), so the outputs are bit-identical to the per-(row, slot) path.
+template <uint M>
+static inline constexpr uint gcls() { return M == 1u ? 0u : (M == 2u ? 1u : 2u); }
+// D2g grid ntiles_max(M) * 2 * OTG threadgroups (ti >= G[c] exit), 256 threads; guo [R*TOPK][2][INTER] (per pair).
+// PH > 1: the k range in PH phases (prep of 20 / PH 128-blocks per row, then their k tiles; each simdgroup still runs
+// its k tiles tk = sg, sg + 8, ... in order): threadgroup memory M * 5 KB / PH.
+template <int K, uint M, uint PH = 1u>
+kernel void fn_moe_gateup_g(device const float *x [[buffer(0)]], device const uint *gt [[buffer(1)]],
+                            device const uint *ut [[buffer(2)]], device const half *gsu [[buffer(3)]],
+                            device const half *usu [[buffer(4)]], device const uint *route [[buffer(5)]],
+                            device float *guo [[buffer(6)]], device const uint *G [[buffer(7)]],
+                            constant uint &R [[buffer(8)]],
+                            uint tg [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint NW = 8u * uint(K);
+  constexpr uint PART = 8u * TPS * 16u;
+  constexpr uint KB = HID / PH, BP = HID / 128u / PH, TP = 160u / PH;  // per phase: halves, 128-blocks, k tiles
+  constexpr bool AL = M > 1u && M * PART * 2u <= M * KB;  // M > 1: the M rows' partial sums alias prep after the k loop
+  threadgroup half prep[M * KB];
+  threadgroup float part1[AL ? 1u : M * PART];
+  threadgroup float *part = AL ? (threadgroup float *)prep : part1;
+  const uint slot = tg / OTG, otg = tg % OTG;
+  const uint ti = slot >> 1u, proj = slot & 1u;
+  if (ti >= G[gcls<M>()]) return;
+  const device uint *te = G + 4u + gcls<M>() * R * TOPK + ti * M;
+  uint es[M];
+  for (uint j = 0u; j < M; j++) es[j] = te[j];
+  const uint eid = route[(es[0] / TOPK) * 20u + es[0] % TOPK] & (NE - 1u);
+  const device uint *wm = (proj ? ut : gt) + (size_t)eid * (160u * 40u) * NW;
+  uint3 cur[TPS];
+  for (uint t = 0u; t < TPS; t++) cur[t] = lane_load<K>(wm + (size_t)(sg * 40u + otg * TPS + t) * NW, lane);
+  const device half *su = (proj ? usu : gsu) + (size_t)eid * HID;
+  const uint q = lane & 3u, col = lane >> 2u;
+  float acc[TPS][M][2];
+  for (uint t = 0u; t < TPS; t++) for (uint j = 0u; j < M; j++) { acc[t][j][0] = 0.0f; acc[t][j][1] = 0.0f; }
+  for (uint ph = 0u; ph < PH; ph++) {
+    if (ph > 0u) threadgroup_barrier(mem_flags::mem_threadgroup);  // the last phase's prep read by every simdgroup
+    for (uint j = 0u; j < M; j++) {
+      if (es[j] == 0xFFFFFFFFu) continue;
+      const device float *xr = x + (es[j] / TOPK) * HID;
+      threadgroup half *pr = prep + j * KB - ph * KB;
+      for (uint b = ph * BP + sg; b < (ph + 1u) * BP; b += 8u) {
+        const uint o = b * 128u + lane;
+        float4 v = float4(xr[o] * float(su[o]), xr[o + 32u] * float(su[o + 32u]), xr[o + 64u] * float(su[o + 64u]),
+                          xr[o + 96u] * float(su[o + 96u]));
+        v = fwht128(v, lane);
+        pr[kp(o)] = half(v.x); pr[kp(o + 32u)] = half(v.y); pr[kp(o + 64u)] = half(v.z); pr[kp(o + 96u)] = half(v.w);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint tk = ph * TP + sg; tk < (ph + 1u) * TP; tk += 8u) {
+      uint3 nxt[TPS];
+      const uint tn = min(tk + 8u, 159u);
+      for (uint t = 0u; t < TPS; t++) nxt[t] = lane_load<K>(wm + (size_t)(tn * 40u + otg * TPS + t) * NW, lane);
+      float4 x4[M];
+      for (uint j = 0u; j < M; j++) x4[j] = float4(((threadgroup const half4 *)(prep + j * KB))[(tk - ph * TP) * 4u + q]);
+      for (uint t = 0u; t < TPS; t++) {
+        float4 w0, w1;
+        dec8<K>(cur[t], lane, w0, w1);
+        for (uint j = 0u; j < M; j++) { acc[t][j][0] += dot(x4[j], w0); acc[t][j][1] += dot(x4[j], w1); }
+        cur[t] = nxt[t];
+      }
+    }
+  }
+  if (AL) threadgroup_barrier(mem_flags::mem_threadgroup);  // every simdgroup done with prep (part aliases it)
+  for (uint j = 0u; j < M; j++)
+    for (uint t = 0u; t < TPS; t++)
+      for (uint i = 0u; i < 2u; i++) {
+        float v = acc[t][j][i];
+        v += simd_shuffle_xor(v, 1u);
+        v += simd_shuffle_xor(v, 2u);
+        if (q == 0u) part[j * PART + (sg * TPS + t) * 16u + i * 8u + col] = v;
+      }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lid < M * TPS * 16u) {
+    const uint j = lid / (TPS * 16u), c = lid % (TPS * 16u);
+    if (es[j] != 0xFFFFFFFFu) {
+      float s = 0.0f;
+      for (uint g = 0u; g < 8u; g++) s += part[j * PART + g * TPS * 16u + c];
+      guo[((size_t)es[j] * 2u + proj) * INTER + otg * TPS * 16u + c] = s;
+    }
+  }
+}
+
+// D3g grid ntiles_max(M) * (HID/128) threadgroups (tile-major; ti >= G[c] exit), 256 * KS threads. Row j of the tile
+// is finished by simdgroup j: its result goes to scr[(row, blk)][slot], and the last of the row's 10 experts for the
+// block sums them in slot order + the gated shared term and writes the row's HC update (= fn_moe_down's finisher).
+template <int K, uint M>
+kernel void fn_moe_down_g(device const float *guo [[buffer(0)]], device const uint *dtr [[buffer(1)]],
+                          device const half *gsv [[buffer(2)]], device const half *usv [[buffer(3)]],
+                          device const half *dsu [[buffer(4)]], device const half *dsv [[buffer(5)]],
+                          device const uint *route [[buffer(6)]], device const float *logits [[buffer(7)]],
+                          device const float *sho [[buffer(8)]], device const float *h [[buffer(9)]],
+                          device const float *inj [[buffer(10)]], device atomic_float *scr [[buffer(11)]],
+                          device atomic_uint *ctr [[buffer(12)]], device float *hout [[buffer(13)]],
+                          device float *branch [[buffer(14)]], device const uint *G [[buffer(15)]],
+                          constant uint &R [[buffer(16)]],
+                          uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+  constexpr uint NW = 8u * uint(K);
+  constexpr uint KTS = 40u / KS;
+  threadgroup half prep[M][INTER];
+  threadgroup float o128[M][128u * KS];
+  const uint ti = tg / (HID / 128u), blk = tg % (HID / 128u);
+  if (ti >= G[gcls<M>()]) return;
+  const device uint *te = G + 4u + gcls<M>() * R * TOPK + ti * M;
+  uint es[M];
+  for (uint j = 0u; j < M; j++) es[j] = te[j];
+  const uint eid = route[(es[0] / TOPK) * 20u + es[0] % TOPK] & (NE - 1u);
+  const device uint *wm = dtr + (size_t)eid * (40u * 160u) * NW;
+  const uint ot = blk * 8u + (sg & 7u);
+  const uint k0 = (sg >> 3u) * KTS;
+  uint3 cur = lane_load<K>(wm + (size_t)(k0 * 160u + ot) * NW, lane);
+  for (uint task = sg; task < M * (INTER / 128u); task += 2u * 8u) {  // (row j, 128-block) prep tasks
+    const uint j = task / (INTER / 128u), b = task % (INTER / 128u);
+    if (es[j] == 0xFFFFFFFFu) continue;
+    const uint o = b * 128u + lane;
+    const device float *g = guo + (size_t)es[j] * 2u * INTER;
+    const device float *u = g + INTER;
+    const device half *sg_ = gsv + (size_t)eid * INTER;
+    const device half *su_ = usv + (size_t)eid * INTER;
+    const device half *sd = dsu + (size_t)eid * INTER;
+    float4 gv = fwht128(float4(g[o], g[o + 32u], g[o + 64u], g[o + 96u]), lane) *
+                float4(float(sg_[o]), float(sg_[o + 32u]), float(sg_[o + 64u]), float(sg_[o + 96u]));
+    float4 uv = fwht128(float4(u[o], u[o + 32u], u[o + 64u], u[o + 96u]), lane) *
+                float4(float(su_[o]), float(su_[o + 32u]), float(su_[o + 64u]), float(su_[o + 96u]));
+    float4 hh = gv / (1.0f + exp(-gv)) * uv * float4(float(sd[o]), float(sd[o + 32u]), float(sd[o + 64u]), float(sd[o + 96u]));
+    hh = fwht128(hh, lane);
+    prep[j][kp(o)] = half(hh.x); prep[j][kp(o + 32u)] = half(hh.y); prep[j][kp(o + 64u)] = half(hh.z); prep[j][kp(o + 96u)] = half(hh.w);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint q = lane & 3u, col = lane >> 2u;
+  float a0[M], a1[M];
+  for (uint j = 0u; j < M; j++) { a0[j] = 0.0f; a1[j] = 0.0f; }
+  for (uint tk = k0; tk < k0 + KTS; tk++) {
+    const uint tn = min(tk + 1u, 39u);
+    const uint3 nxt = lane_load<K>(wm + (size_t)(tn * 160u + ot) * NW, lane);
+    float4 x4[M];
+    for (uint j = 0u; j < M; j++) x4[j] = float4(((threadgroup const half4 *)prep[j])[tk * 4u + q]);
+    float4 w0, w1;
+    dec8<K>(cur, lane, w0, w1);
+    for (uint j = 0u; j < M; j++) { a0[j] += dot(x4[j], w0); a1[j] += dot(x4[j], w1); }
+    cur = nxt;
+  }
+  for (uint j = 0u; j < M; j++) {
+    float b0 = a0[j], b1 = a1[j];
+    b0 += simd_shuffle_xor(b0, 1u); b0 += simd_shuffle_xor(b0, 2u);
+    b1 += simd_shuffle_xor(b1, 1u); b1 += simd_shuffle_xor(b1, 2u);
+    if (q == 0u) { o128[j][sg * 16u + col] = b0; o128[j][sg * 16u + col + 8u] = b1; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg >= M) return;
+  const uint j = sg;
+  if (es[j] == 0xFFFFFFFFu) return;
+  const uint xr = es[j] / TOPK, k = es[j] % TOPK;
+  float4 ov;
+  for (uint i = 0u; i < 4u; i++) {
+    float t = o128[j][lane + 32u * i];
+    for (uint s2 = 1u; s2 < KS; s2++) t += o128[j][s2 * 128u + lane + 32u * i];
+    ov[i] = t;
+  }
+  const uint c0 = blk * 128u + lane;
+  const float sc = as_type<float>(route[xr * 20u + TOPK + k]);
+  const device half *sv = dsv + (size_t)eid * HID;
+  float4 v = fwht128(ov, lane) * float4(float(sv[c0]), float(sv[c0 + 32u]), float(sv[c0 + 64u]), float(sv[c0 + 96u])) * sc;
+  const uint rb = xr * (HID / 128u) + blk;
+  const float sgt = sigm(logits[xr * (NE + 1u) + NE]);
+  const device float *ip = inj + xr * 2u * HC;
+  const float4 ij = float4(ip[0], ip[1], ip[2], ip[3]);
+  const device float *hr = h + xr * HC * HID;
+  float hv[4][HC], shv[4];
+  for (uint i = 0u; i < 4u; i++) {
+    const uint c = blk * 128u + lane + 32u * i;
+    shv[i] = sho[xr * HID + c];
+    for (uint st = 0u; st < HC; st++) hv[i][st] = hr[st * HID + c];
+  }
+  device atomic_float *sp = scr + ((size_t)rb * TOPK + k) * 128u;
+  atomic_store_explicit(&sp[lane], v.x, memory_order_relaxed);
+  atomic_store_explicit(&sp[lane + 32u], v.y, memory_order_relaxed);
+  atomic_store_explicit(&sp[lane + 64u], v.z, memory_order_relaxed);
+  atomic_store_explicit(&sp[lane + 96u], v.w, memory_order_relaxed);
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+  uint old = 0u;
+  if (lane == 0u) old = atomic_fetch_add_explicit(&ctr[rb], 1u, memory_order_relaxed);
+  old = simd_broadcast(old, 0);
+  if (old != TOPK - 1u) return;
+  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+  device atomic_float *sb = scr + (size_t)rb * TOPK * 128u;
+  device float *hor = hout + xr * HC * HID;
+  for (uint i = 0u; i < 4u; i++) {
+    const uint c = blk * 128u + lane + 32u * i;
+    float s = 0.0f;
+    for (uint e = 0u; e < TOPK; e++) s += atomic_load_explicit(&sb[e * 128u + lane + 32u * i], memory_order_relaxed);
+    const float br = rr(rr(s) + rr(rr(sgt) * shv[i]));
+    branch[xr * HID + c] = br;
+    for (uint st = 0u; st < HC; st++) hor[st * HID + c] = rr(hv[i][st] + rr(br * ij[st]));
+  }
+  if (lane == 0u) atomic_store_explicit(&ctr[rb], 0u, memory_order_relaxed);
+}
+
 #define NE_INST(name, func, ...) template [[host_name(name)]] [[kernel]] decltype(func<__VA_ARGS__>) func<__VA_ARGS__>;
 #define NE_INST_MOEU(R)                                     \
   NE_INST("fn_moe_gateup_u_k4_r" #R, fn_moe_gateup_u, 4, R)  \
@@ -622,6 +895,23 @@ NE_INST_MOEU(2)
 NE_INST_MOEU(3)
 NE_INST_MOEU(4)
 NE_INST_MOEU(5)
+#define NE_INST_MOEG(M)                                     \
+  NE_INST("fn_moe_gateup_g_k4_m" #M, fn_moe_gateup_g, 4, M)  \
+  NE_INST("fn_moe_gateup_g_k5_m" #M, fn_moe_gateup_g, 5, M)  \
+  NE_INST("fn_moe_gateup_g_k6_m" #M, fn_moe_gateup_g, 6, M)  \
+  NE_INST("fn_moe_down_g_k4_m" #M, fn_moe_down_g, 4, M)      \
+  NE_INST("fn_moe_down_g_k5_m" #M, fn_moe_down_g, 5, M)      \
+  NE_INST("fn_moe_down_g_k6_m" #M, fn_moe_down_g, 6, M)
+NE_INST_MOEG(1)
+NE_INST_MOEG(2)
+NE_INST_MOEG(4)
+#define NE_INST_MOEGP(M, P)                                                \
+  NE_INST("fn_moe_gateup_g_k4_m" #M "_p" #P, fn_moe_gateup_g, 4, M, P)  \
+  NE_INST("fn_moe_gateup_g_k5_m" #M "_p" #P, fn_moe_gateup_g, 5, M, P)  \
+  NE_INST("fn_moe_gateup_g_k6_m" #M "_p" #P, fn_moe_gateup_g, 6, M, P)
+NE_INST_MOEGP(2, 2)
+NE_INST_MOEGP(4, 2)
+NE_INST_MOEGP(4, 4)
 #define NE_INST_MOES(R)                                               \
   NE_INST("fn_moe_gateup_s_k4_r" #R, fn_moe_gateup, 4, R, true)       \
   NE_INST("fn_moe_gateup_s_k5_r" #R, fn_moe_gateup, 5, R, true)       \

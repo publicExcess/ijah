@@ -26,9 +26,9 @@ kernel void dfl_hc_mean(device const float *h [[buffer(0)]], device float *f [[b
 // The same for a prefill chunk (lab-dflash): chunk rows a.z .. a.z + a.x -> the feature ring row (posbase + row) % 2048.
 kernel void dfl_hc_mean_ring(device const float *h [[buffer(0)]], device float *f [[buffer(1)]],
                              device const uint *posbase [[buffer(2)]], constant uint4 &a [[buffer(3)]],
-                             uint gid [[thread_position_in_grid]]) {
+                             device const uint *flag [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
   const uint n = a.x * DH;
-  if (gid >= n) return;
+  if (gid >= n || flag[0] == 0u) return;
   const uint r = gid / DH, i = gid % DH, row = r + a.z;
   device const float *p = h + (ulong)row * (4u * DH) + i;
   const float s = (p[0] + p[DH]) + (p[2u * DH] + p[3u * DH]);

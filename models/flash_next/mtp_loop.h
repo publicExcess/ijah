@@ -114,7 +114,10 @@ NE_API int ne_fn_dfl_commit(ne_fn_mtp *p, const int *toks, int c);
 // kmax (0 = keep), active (-1 = keep; 0 = no block drafts and no context upkeep, for A/B). last: the last run's DFlash rounds / tokens.
 NE_API int ne_fn_dfl_enable(ne_fn_mtp *p, const char *dir, int block, int kmax, int bits, int gate);
 NE_API int ne_fn_dfl_set(ne_fn_mtp *p, int gate, int kmax, int active);  // -1 / 0 = keep
+// lab-moegroup: the DFlash2 gate's round-cost table: 0 per-pair rounds (default), 1 grouped rounds, -1 by the MoE path
+NE_API int ne_fn_dfl_set_vcost(ne_fn_mtp *p, int mode);
 NE_API int ne_fn_dfl_on(ne_fn_mtp *p);
+NE_API int ne_fn_dfl_set_max_ctx(ne_fn_mtp *p, int maxctx);  // lab-dflfix: MTP head past it (default 8192)
 NE_API int ne_fn_dfl_last(ne_fn_mtp *p, int *rounds, int *tokens);
 // checks: the drafter's context from host feature rows f32 [n][12800] at positions [pos, pos + n); one block draft at
 // the context's end with its internals (hn [B - 1][2560], sl / qo [B - 1][16][2], drafts [B - 1], GPU ms).
@@ -127,6 +130,8 @@ NE_API int ne_fn_dfl_probe(ne_fn_mtp *p, int anchor, int sampled, float temp, ui
 NE_API int ne_fn_mtp_set_moe_dedupe(ne_fn_mtp *p, int on);
 // lab-verify: g_moe_split (NE_FN_MOE_SPLIT) on / off; re-records the verifies.
 NE_API int ne_fn_mtp_set_moe_split(ne_fn_mtp *p, int on);
+// lab-moegroup: g_moe_group (NE_FN_MOE_GROUP: 0 off, N = grouped routed experts at R >= max(2, N)); re-records the verifies.
+NE_API int ne_fn_mtp_set_moe_group(ne_fn_mtp *p, int min_rows);
 NE_API int ne_fn_mtp_prof(ne_fn_mtp *p, int T, int reps, double *out, int nout);
 NE_API int ne_fn_mtp_verify_forced(ne_fn_mtp *p, const int *prompt, int n, const int *cont, int nc, int R,
                                    const int *keeps, int nk, float *logits);

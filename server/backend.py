@@ -42,6 +42,7 @@ BINARY_PIECES = os.environ.get("NE_SRV_PIECES", "") == "binary"
 # lab-pfpath: NE_SRV_TRACE=1 logs a timestamped line at each step of a request's path (HTTP parse, template, queue,
 # restore, every prefill piece, checkpoint, first token, first SSE write) to stderr; no behaviour change
 TRACE = os.environ.get("NE_SRV_TRACE", "") == "1"
+MTP_STATS = os.environ.get("NE_MTP_STATS", "") == "1"   # lab-splashcmp: per-segment MTP stats on stderr
 # lab-pfpath: pass the next piece's tokens to the engine (its n-gram rows read in the current piece's GPU shadow);
 # NE_SRV_AHEAD=0: off (A/B)
 AHEAD = os.environ.get("NE_SRV_AHEAD", "1") != "0"
@@ -108,7 +109,7 @@ class RealBackend:
     VOCAB = 248320            # lm_head rows = the sampler's mask is (VOCAB + 31) // 32 words
 
     def __init__(self, root, pack_dir, ctx, mtp_depth=2, lib=None, shim=None, log=print, share=None, engine=None,
-                 state_from=None):
+                 state_from=None, drafter=None):
         """share: another RealBackend whose engine / pack this one reuses (a further slot: own model instance =
         own KV / GDN state / scratch, the pack's weights shared). engine: another RealBackend whose engine opens this
         backend's pack (a further model in the same process: tensors in files both packs list -- same inode -- are
@@ -161,27 +162,29 @@ class RealBackend:
             L.ne_fn_mtp_generate.restype = C.c_int
             L.ne_fn_mtp_generate.argtypes = [C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_int, C.c_uint64,
                                              C.c_void_p, C.c_void_p, C.c_void_p]
-            # lab-dflash (docs/mtp.md 13): the DFlash2 block drafter (ne_server --drafter dflash2 --drafter-path DIR)
-            drafter = os.environ.get("NE_DRAFTER", "mtp")
-            if drafter not in ("mtp", "dflash2"):
-                raise E.EngineError(f"NE_DRAFTER={drafter}: mtp or dflash2")
-            dkmax = int(os.environ.get("NE_DFL_KMAX", "5")) if drafter == "dflash2" else 0
+            # lab-dflash (docs/mtp.md 13): the DFlash2 block drafter of THIS model instance (lab-dflfix: per model id,
+            # from server/models.json's "drafter" field; dict path / block / kmax / bits / gate, or None = the MTP head)
+            dkmax = int(drafter["kmax"]) if drafter else 0
+            if drafter and not 1 <= dkmax <= 7:
+                raise E.EngineError(f"DFlash2 kmax {dkmax}: 1 .. 7")
             self.mtp_ptr = L.ne_fn_mtp_create(C.c_void_p(self.m.ptr), max(4, mtp_depth, dkmax), 4)
             if not self.mtp_ptr:
                 raise E.EngineError(f"ne_fn_mtp_create: {self.eng.last_error()}")
-            self.drafter = "mtp"
-            if drafter == "dflash2":
-                dpath = os.environ.get("NE_DRAFTER_PATH", "")
-                if not dpath or not self.eng.has("ne_fn_dfl_enable"):
-                    raise E.EngineError("--drafter dflash2 needs --drafter-path DIR and a libengine with ne_fn_dfl_enable")
+            self.drafter = None
+            if drafter:
+                if not self.eng.has("ne_fn_dfl_enable"):
+                    raise E.EngineError("this libengine has no DFlash2 drafter (ne_fn_dfl_enable)")
                 f = self.eng.fn("ne_fn_dfl_enable", C.c_int, [C.c_void_p, C.c_char_p, C.c_int, C.c_int, C.c_int, C.c_int])
                 t1 = time.time()
-                if f(C.c_void_p(self.mtp_ptr), dpath.encode(), int(os.environ.get("NE_DFL_BLOCK", "8")), dkmax,
-                     int(os.environ.get("NE_DFL_BITS", "8")), int(os.environ.get("NE_DFL_GATE", "1"))):
+                if f(C.c_void_p(self.mtp_ptr), str(drafter["path"]).encode(), int(drafter["block"]), dkmax,
+                     int(drafter["bits"]), int(drafter["gate"])):
                     raise E.EngineError(f"ne_fn_dfl_enable: {self.eng.last_error()}")
-                self.drafter = "dflash2"
-                log(f"DFlash2 drafter: {dpath} (block {os.environ.get('NE_DFL_BLOCK', '8')}, kmax {dkmax}, "
-                    f"{os.environ.get('NE_DFL_BITS', '8')}-bit; {time.time() - t1:.1f} s)")
+                if drafter.get("max_ctx") is not None and self.eng.has("ne_fn_dfl_set_max_ctx"):
+                    self.eng.fn("ne_fn_dfl_set_max_ctx", C.c_int, [C.c_void_p, C.c_int])(C.c_void_p(self.mtp_ptr),
+                                                                                       int(drafter["max_ctx"]))
+                self.drafter = dict(drafter)
+                log(f"DFlash2 drafter: {drafter['path']} (block {drafter['block']}, kmax {dkmax}, {drafter['bits']}-bit, "
+                    f"gate {drafter['gate']}; {time.time() - t1:.1f} s)")
         # MTP from the current state (lab-mtpcont, docs/mtp.md 10.9): feeds / steps keep the MTP head in step
         self.mtp_cont = bool(self.mtp_ptr) and self.eng.has("ne_fn_mtp_generate_from")
         self.mtp_abortable = bool(self.mtp_ptr) and self.eng.has("ne_fn_mtp_generate_cb")
@@ -659,7 +662,8 @@ class MockBackend:
     fed, rows, dirty = _shared("fed"), _shared("rows"), _shared("dirty")
 
     def __init__(self, tokenizer, ctx=32768, delay=0.0, prefill_rate=None, mtp_depth=2, snapshots=True, cont=True,
-                 name=None, share_state=None):
+                 name=None, share_state=None, drafter=None):
+        self.drafter = drafter  # lab-dflfix: the mock has no drafter; the label is only carried
         self.name = name      # served model id (several models in one server: WHOAMI answers with it)
         # share_state: another mock whose recurrent state + KV rows this one uses (--share-state; the head is own)
         self._s = share_state._s if share_state is not None else {"fed": [], "rows": [], "dirty": False}
@@ -1412,6 +1416,8 @@ class Session:
                     self.rates.obs("pf_mtp", n / (st["prefill_ms"] / 1e3))
                 if st.get("decode_ms") and st.get("tokens", 0) > 32:
                     self.rates.obs("dec_mtp", st["tokens"] / (st["decode_ms"] / 1e3))
+                if MTP_STATS:   # lab-splashcmp: one line per MTP/DFlash2 segment (tokens, rounds, draft / verify GPU ms)
+                    print("mtpstats " + json.dumps({k: round(v, 3) for k, v in st.items()}), file=sys.stderr, flush=True)
                 self.rates.obs("out", len(toks))
                 self._enforce()
                 return stats
@@ -1533,6 +1539,8 @@ class Session:
                 out.extend(toks)
                 if st.get("decode_ms") and st.get("tokens", 0) > 32:
                     self.rates.obs("dec_mtp", st["tokens"] / (st["decode_ms"] / 1e3))
+                if MTP_STATS:   # lab-splashcmp: one line per MTP/DFlash2 segment (tokens, rounds, draft / verify GPU ms)
+                    print("mtpstats " + json.dumps({k: round(v, 3) for k, v in st.items()}), file=sys.stderr, flush=True)
                 return toks, st, time.perf_counter() - t3
 
             if first_mtp:  # MTP rounds from the reused state

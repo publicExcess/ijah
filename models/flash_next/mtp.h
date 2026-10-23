@@ -128,6 +128,43 @@ VerifyResult accept_sampled_p(const int *drafts, int D, const Dist *p, const Dis
 // target's sampler (temperature / top-k / top-p over the K ids; greedy = the best id).
 Dist shortlist_dist(const float *sl_row, int K, const SampleParams &sp);
 
+// ---- the gated verify (lab-dflfix, docs/mtp.md 13.9): which prefix d_1 .. d_k of K sampled drafts to verify.
+// EXACT only if whether d_j is verified depends on nothing but d_<j and q_j's distribution (both fixed before d_j is
+// drawn): a rule that looks at q_j(d_j) or later drafts verifies d_j more often for some values than for others, and a
+// cut position's token is then a fresh draw from p, so the output mixes the two and is not p (the shipped 19 Oct gate
+// did this). This rule: d_1 always; d_j (j >= 2) iff prod_{i<j} acc(q_i(d_i)) * E_j >= rate * (cost[j + 1] - cost[j]),
+// E_j = sum_x q_j(x) acc(q_j(x)) (the expected acceptance from q_j's distribution), stopping at the first exclusion.
+// acc[10] = P(accepted | q(d) in bin b of 0.1), cost[R] = round ms at R verify rows (R <= 8), rate = tokens per ms.
+// Greedy rounds accept by match: any rule is exact there.
+struct GateParams {
+  const double *acc = nullptr;
+  const double *cost = nullptr;
+  double rate = 0.11;
+};
+int gate_bin(double q);
+double gate_expected(const Dist &q, const double *acc);  // E = sum_x q(x) acc(bin(q(x)))
+int gate_prefix(const Dist *q, const int *drafts, int K, const GateParams &g);
+
+// ---- lookahead gate over path-independent confidences (lab-dfllook, docs/mtp.md 13.10; after Splash 1.4.0 PR #487,
+// incoai/splash, Apache-2.0: per-position confidence, online logistic refit, rows chosen by expected tokens per cost).
+// conf[j] (j < K) must be fixed before ANY draft of the round is drawn (DFlash2: the top probability of position j's
+// unary readout, i.e. the block forward's 16 exact logits before the selector's path-dependent edge term). Then the
+// chosen k depends on nothing drawn and the accept stays exact speculative sampling, whatever the lookahead.
+// p_j = sigmoid(slope * logit(conf[j]) + icpt[j]); E(k) = 1 + sum_{j<=k} prod_{i<=j} p_i; k = argmax E(k) / cost[k + 1].
+struct AcceptFit {
+  double slope = 1.0, icpt[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  int cap = 4096, every = 64, rounds = 0;
+  std::vector<float> c;  // label ring: confidence, position, accepted
+  std::vector<uint8_t> pos, y;
+  size_t head = 0;
+  void reset(double slope0, const double *icpt0);  // icpt0[8]
+  double prob(double conf, int j) const;
+  void add(double conf, int j, bool accepted);
+  void round_done();  // refits every `every` rounds on the last `cap` labels (IRLS, 6 iterations, tiny ridge)
+  void refit();
+};
+int gate_lookahead(const double *conf, int K, const AcceptFit &f, const double *cost);
+
 // What to keep after a verify of D + 1 rows from cache length T0 with `accepted` drafts accepted (docs/mtp.md):
 struct CommitPlan {
   int keep_rows = 0;     // verify rows whose state is committed: accepted + 1 (t1 and the accepted drafts)

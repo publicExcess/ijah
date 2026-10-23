@@ -1,49 +1,62 @@
-<p align="center"><img src="assets/ijah-logo.svg" width="160" alt="Ijah, a pixel-art rottweiler pup"></p>
+<p align="center"><img src="assets/ijah-logo.svg" width="140" alt="Ijah, a pixel-art rottweiler pup"></p>
 
 # Ijah
 
-Ijah is an LLM inference engine for Apple M5 written from scratch on raw Metal: an Objective-C++ core, Metal kernels,
-and no MLX in the serving path. It runs one model family, **Qwen3.8-Flash-Next** and its fine-tune **Swift-1.5
-Flash-Next**, and serves them over an OpenAI- and Anthropic-compatible HTTP API.
+**A raw-Metal inference engine for Qwen3.8-Flash-Next and Swift-1.5 on the Apple M5 Max. It runs higher-fidelity EXL3
+weights at the speed of 4-bit engines.**
 
-- **EXL3 trellis weights**: 5-bit experts and a 6/8-bit trunk, decoded on the fly inside fused MoE and GEMV kernels.
-- **MTP speculative decoding** with the model's own multi-token-prediction head (draft depth 2 by default), and an
-  opt-in **DFlash2 block drafter** in the same loop for about 7-10% more decode speed.
-- **Chunked prefill** on the M5 GPU's tensor units (NAX), with QSA sparse attention for long contexts (262K window).
-- **Prefix cache** in RAM and optionally on SSD. Conversations survive server restarts, and **shared-prefix
-  snapshots** let a new session reuse the long system prompt and tool block that earlier sessions already prefilled.
-- **Vision**: the model's own vision tower runs in the engine, and image parts work in chat requests.
-- **Server**: `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/models`, streaming, tool calls,
-  structured output (`response_format`, forced `tool_choice`), logprobs, logit bias and penalties, and two models in
-  one process.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/charts/hero-dark.svg">
+    <img src="assets/charts/hero-light.svg" width="820" alt="Scatter chart of decode speed against KL divergence from the bf16 model (set B, log scale) for Ijah T6 and Ijah 4-bit with DFlash2, Splash 1.4 with the UD-IQ4_XS and Q4_0 GGUFs, and oMLX with oQ4e. Lower and further right is better. The numbers are in the tables below.">
+  </picture>
+</p>
 
-## Requirements
+## Why
 
-- An **Apple M5** Mac (Ijah needs the Metal 4 tensor units; M1 to M4 are not supported) on **macOS 27**.
-- **About 90 GB of free unified memory** for one model at the full 262K context (~81 GB of weights plus ~28 KB per
-  context token). In practice that means a 128 GB machine with no other model loaded.
-- About 185 GB of disk for one model: the 83 GB pack plus the 102 GB n-gram embedding table, which both models
-  share. A second model adds about 4 GB once the shared files are linked (see below), 83 GB otherwise. The optional
-  DFlash2 drafter adds about 1.2 GB on disk and about 1 GB of memory when enabled.
-- Xcode command-line tools with the Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`), and Python 3.11
-  or newer for the server.
+On a 128 GB Mac the weights take up most of the memory, so what matters is how much of the full model each byte keeps.
+Ijah uses EXL3 trellis weights (5-bit experts, 6/8-bit trunk), which keep far more of the full model per byte than
+4-bit GGUF or MLX weights, and decodes them inside its fused Metal kernels.
+
+- **Closer to the full model.** Ijah's published pack has a KL divergence from bf16 of **0.0092** on our reasoning set,
+  against **0.036** for the UD-IQ4_XS GGUF and oMLX's oQ4e, and **0.115** for a plain Q4_0 GGUF. It picks the same
+  top token as bf16 97.5% of the time.
+- **Comparable speed.** With the DFlash2 drafter the published pack decodes at **122 tok/s**, against 128-132 for
+  Splash 1.4 and 92 for oMLX. With 4-bit experts Ijah reaches **133 tok/s**, level with Splash's fastest file while
+  staying 2-6x closer to bf16.
+
+Ijah is an Objective-C++ core and Metal kernels with no MLX in the serving path. It serves an OpenAI- and
+Anthropic-compatible HTTP API (streaming, tool calls, structured output, vision) and has a prefix cache that survives
+restarts.
 
 ## Quick start
 
+You need an **Apple M5** Mac on **macOS 27** (Ijah uses the Metal 4 tensor units; M1 to M4 do not work), about
+**90 GB of free unified memory** for one model at the full 262K context, **185 GB of disk** (83 GB pack plus the 102 GB
+n-gram table), the Xcode command-line tools with the Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`)
+and Python 3.11 or newer.
+
+With Homebrew (once the tap is published):
+
+```sh
+brew install publicExcess/ijah/ijah    # builds the engine, the server's Python env and the `ijah` command
+```
+
+Or from source:
+
 ```sh
 git clone https://github.com/publicExcess/ijah && cd ijah
-make venv                       # .venv with requirements.txt (python3.11+)
-make                            # build/libengine.dylib, build/engine.metallib, CLIs and test binaries
+make venv && make                      # Python env, then build/libengine.dylib, build/engine.metallib and the CLIs
+export PATH=$PWD/tools:$PATH           # the `ijah` command
+```
 
-# a pack: the weights, tokenizer and chat template (~83 GB) ...
-hf download SiliconSpecies/Qwen3.8-Flash-Next-EXL3-Ijah \
-  --local-dir ~/.cache/ijah/packs/Qwen3.8-Flash-Next-EXL3-Ijah
-# ... plus the model's n-gram embedding table (102 GB, read from the SSD, never loaded into GPU memory)
-hf download SiliconSpecies/Qwen3.8-Flash-Next-ngram-table ngram_table.bin \
-  --local-dir ~/.cache/ijah/packs/Qwen3.8-Flash-Next-EXL3-Ijah
+Then download the model and start the server:
 
-tools/serve.sh start            # creates ~/.config/ijah/api-key on first start; waits until /health answers
-tools/serve.sh status           # also: stop, log [N], models
+```sh
+ijah download base drafter ngram       # ~83 GB pack, 1.2 GB DFlash2 drafter, 102 GB n-gram table, into ~/.cache/ijah
+ijah doctor                            # checks the Mac, the build, the packs, the key and the port
+ijah serve start                       # makes ~/.config/ijah/api-key on first start, waits until /health answers
+ijah serve status                      # also: stop, restart, log [N]; `brew services start ijah` runs it at login
 ```
 
 ```sh
@@ -53,201 +66,140 @@ curl -s http://127.0.0.1:8140/v1/chat/completions \
        "messages": [{"role": "user", "content": "Write a haiku about unified memory."}]}'
 ```
 
-The server binds to 127.0.0.1 only, and every `/v1` request needs the key.
+The server listens on 127.0.0.1 only, and every `/v1` request needs the key. `ijah download` pins every revision; the
+same files can be fetched by hand with `hf download` (the repos are in the table below).
 
-**Swift-1.5** (UkisAI's fine-tune; Swift Open License 1.0, **non-commercial use only**): download
-`SiliconSpecies/Swift-1.5-Flash-Next-EXL3-Ijah` the same way, put the same `ngram_table.bin` in its folder (a hard
-link saves 102 GB: `ln ~/.cache/ijah/packs/Qwen3.8-Flash-Next-EXL3-Ijah/ngram_table.bin
-~/.cache/ijah/packs/Swift-1.5-Flash-Next-EXL3-Ijah/`), and start with
-`NE_MODEL=Swift-1.5-Flash-Next-native tools/serve.sh start`.
+**DFlash2 drafter** (on by default, about +7-15% decode at short context): every model id uses Inco's draft model when
+it is in `~/.cache/ijah/drafters`. Without it the server drafts with the model's own MTP head and says once in the log
+how to get it. `ijah serve start -- --drafter none` forces the MTP head; the older `-dflash` model ids still work as
+names for the same model with the drafter required.
 
-`NE_MODEL=all` serves both models from one process. Most of the two packs is identical (the routed experts and more,
-about 79 GB), and the engine maps those files once only when they are the same files on disk. Link them first:
-`tools/link_shared_packs.py ~/.cache/ijah/packs/Qwen3.8-Flash-Next-EXL3-Ijah ~/.cache/ijah/packs/Swift-1.5-Flash-Next-EXL3-Ijah`.
-It hard-links only byte-identical files (Swift-1.5's changed trunk files have the same names and sizes but different
-contents, so they are left alone). Without it, memory use roughly doubles and the 96 GB figure below does not hold.
-
-## Configuration
-
-| setting | default | what it does |
-|---|---|---|
-| `IJAH_PACKS` | `~/.cache/ijah/packs` | where model ids find their packs (`server/models.json`) |
-| `IJAH_PACK`, `IJAH_GOLDEN_PACK` | the Qwen3.8 pack | the pack the tests and tools use |
-| `IJAH_PY` | `.venv/bin/python` | the Python the scripts use |
-| `IJAH_KEY_FILE` | `~/.config/ijah/api-key` | the API key (`tools/serve.sh keygen` writes one; it is never printed) |
-| `NE_MODEL` | `Qwen3.8-Flash-Next-native` | the model id(s) to serve: an id, `ID1,ID2`, or `all` |
-| `NE_SERVE_PORT` | `8140` | the port |
-| `IJAH_LOCK_SCRIPT` | unset | an optional machine-wide lock for heavy jobs (`tools/machine-lock.sh` works) |
-| `NEED_GB` | 85 (96 for two models) | the server refuses to start with less free memory than this |
-
-Runtime knobs inside the engine and server keep their `NE_` prefix (from the engine's working name); the settings
-added for the public release use `IJAH_`.
-
-Server flags go after `--`, for example `tools/serve.sh start -- --ctx 65536 --cache-disk 20GB`:
-
-- `--ctx N`: the context window, which is also the reply cap (default 262144).
-- `--mtp N` (default 2; 0 turns MTP off) and `--mtp-policy auto|always|never`.
-- `--drafter mtp|dflash2` (default `mtp`): draft with Inco's DFlash2 block drafter inside the MTP loop. Needs
-  `--drafter-path DIR` (the draft model, see the section below), takes `--dflash-kmax N` (default 5, at most 5 in this
-  build) and `--dflash-bits 8|4` (default 8). `--mtp N` is the loop depth, so it must be at least kmax.
-- `--allow-any-model`: on a single-model server, let a request name any model and get the default one. Off by default:
-  an unknown name is a 400 that lists the ids served, in both directions, so a drafter run cannot silently be a
-  control run (docs/server.md 13).
-- `--effort xhigh|medium|low`: the reasoning effort for requests that do not set one.
-- `--cache-ram 8GB`, `--cache-disk 0` (for example `20GB` turns the SSD tier on), `--cache-dir`.
-- `--slots N`: concurrent requests per model. Each extra slot holds a full KV cache (~7 GB at 262K).
-- `--prefill-int8` (opt-in): int8 activations for the trunk in prefill. About 3-4% faster cold prefill; the quality
-  change is within noise on two test sets and slightly worse on one (docs/prefill.md 4f). It is off by default.
-- `--pack DIR`: serve a pack directory directly instead of looking up the model id.
-
-`docs/server.md` covers the rest: the prefix cache, shared-prefix snapshots, the supervisor that restarts the server
-after a crash, and the request extensions.
-
-## How it compares
-
-<p align="center"><img src="assets/charts/ijah-tradeoff.svg" width="640" alt="Speed versus closeness to the bf16 model: Ijah, oMLX and Sushi"></p>
-<p align="center"><img src="assets/charts/ijah-speed.svg" width="820" alt="Decode and cold-prefill speed: Ijah, oMLX and Sushi"></p>
-<p align="center"><img src="assets/charts/ijah-quality.svg" width="820" alt="KL divergence from the bf16 model on three test sets: Ijah, oMLX and Sushi"></p>
-
-In short, against the two engines we ran head to head: **oMLX** with Jundot's Qwen3.8-Flash-Next-oQ4e, and **Sushi**
-with its own Sushi-4bpw pack. All three on one streaming client, the same prompts and seeds, each on its own weights
-and best settings.
-
-- **Quality:** Ijah is 4-5x closer to the bf16 model than oMLX on all three test sets, and 1.7-2x closer than Sushi.
-- **Decode:** Ijah is **1.16x Sushi** (95% CI 1.12-1.20, 18 of 18 pairs: 98.9 vs 85.8 tok/s), and about 6% behind oMLX
-  (0.94x, CI 0.92-0.96, 2 of 18 pairs; 105.2 tok/s) with its 5-bit experts. An experiment with 4-bit experts (sushi's
-  4-bit expert shards with Ijah's trunk; not a published pack) matches oMLX's speed.
-- **Cold prefill:** Ijah is behind oMLX, by about 12% at 10K tokens and about 27% at 32K. It is about 5% ahead of Sushi
-  at 10K (2,120 vs 2,014) and level with it at 32K (2,052 vs 2,026).
-- **Agent sessions:** later turns of a conversation start in about 0.2 s (exact prefix reuse). A new session's first
-  turn starts in about 0.3 s when an earlier session already sent the same tool block and system prompt
-  (shared-prefix snapshots).
-
-### DFlash2 drafter (opt-in, +7-10% decode)
-
-Inco's **DFlash2** is a 0.6B block-diffusion draft model: one pass proposes a whole block of tokens, keeps the top 16
-candidates per position, and a small selector traces one coherent path through them. In Ijah it is a **second drafter
-inside the MTP loop, not a replacement for it** - the native MTP head drafts the rounds the drafter's context cannot
-reach (a prompt shorter than 512 rows, copy-rule rounds) and stays in step so it can take over.
-
-Start it with the model id that asks for it:
+**Swift-1.5** (UkisAI's fine-tune, **non-commercial use only**): download its pack, link it to the base pack's files
+(the n-gram table and about 79 GB of identical expert files, then stored and loaded once), and start it by id.
 
 ```sh
-hf download incoai/Qwen3.8-Flash-Next-DFlash2 --local-dir ~/.cache/ijah/drafters/Qwen3.8-Flash-Next-DFlash2
-tools/serve.sh start -- --mtp 5 --drafter dflash2 \
-  --drafter-path ~/.cache/ijah/drafters/Qwen3.8-Flash-Next-DFlash2
-# requests then send "model": "Swift-1.5-Flash-Next-native-dflash"
+ijah download swift && ijah link
+ijah serve start Swift-1.5-Flash-Next-native
+ijah serve start all                   # or both models in one process; requests pick one with "model"
 ```
 
-Measured on the same client as the charts (6 prompts x 3 seeds, 1,024 tokens, T=1, medium thinking), paired by prompt
-and seed: **120.4 tok/s against 112.4 and 108.9** for MTP depth 2, ratios **1.067 [1.036, 1.097]** (13 of 18 pairs) and
-**1.101 [1.069, 1.132]** (17 of 18). By prompt: maths +14%, reasoning prose +13%, parser code +11%, LRU code +2%,
-climate prose +1%, and low-acceptance prose **-3%** - the one prompt that loses.
+**4-bit pack** (faster, lower fidelity; the T6 pack is the preferred one): `ijah download base-4bit`, then
+`ijah serve start Qwen3.8-Flash-Next-native-4bit`.
 
-This build instantiates the verify kernels to 6 rows, so `--dflash-kmax` tops out at 5 (verify runs kmax + 1 rows);
-deeper verify is built and measured in development, not here. Off by default: a server started without `--drafter` has
-no drafter, advertises no drafter id, and refuses a request that asks for one.
+Server flags go after `--`, for example `ijah serve start -- --ctx 65536 --cache-disk 20GB` (`ijah` wraps
+`tools/serve.sh`, which takes the same arguments). `docs/server.md` lists every flag and setting.
 
-### How we measured
+## Models
 
-- **Machine:** Apple M5 Max (40-core GPU), 128 GB, macOS 27.0.1. One engine loaded at a time, nothing else running.
-- **Compared against:** oMLX 0.7.1.dev1 with Jundot's Qwen3.8-Flash-Next-oQ4e (mixed 4–8-bit, 4.72 bits per weight),
-  using tuned settings: MTP at depth 2 and INT8-activation prefill. Sushi with its own `Qwen3.8-Flash-Next-Sushi-4bpw`
-  pack (4-bit experts, 8-bit trunk) at its default settings, MTP on. Ijah ran its default T6 pack (5-bit EXL3 experts,
-  6/8-bit trunk) with MTP at depth 2. Each engine uses its own weight format, so the numbers compare
-  **engine + weights**, not the engines alone. The three packs sit at different quality and size points, which is why
-  the quality chart is shown beside the speed chart.
-- **Same client for all three:** one streaming OpenAI-compatible client, the same prompts and seeds, sampling at
-  temperature 1.0 / top-p 0.95 / top-k 20, thinking on at medium effort.
-- **Decode:** 6 prompts (code, maths, prose) × 3 seeds, 1,024 generated tokens each. We report the mean with a 95%
-  confidence interval, and compare the engines pair by pair on the same prompt and seed.
-- **Prefill:** cold prompts of 10K and 32K tokens with no cache hit, 5 runs each, timed to the first streamed token
-  over HTTP. We report the median with the min–max range.
-- **Quality:** KL divergence between each engine's next-token distribution and the unquantised (bf16) model's, over
-  the full vocabulary with teacher forcing. Three test sets: A, wikitext-2 (16 windows); B, reasoning traces (16
-  windows); C, 32K-token code context (4 windows). Error bars are 95% bootstrap intervals over windows.
+| what | Hugging Face | size | notes |
+|---|---|---|---|
+| Qwen3.8-Flash-Next, Ijah T6 pack | [SiliconSpecies/Qwen3.8-Flash-Next-EXL3-Ijah](https://huggingface.co/SiliconSpecies/Qwen3.8-Flash-Next-EXL3-Ijah) | 83 GB | EXL3 5-bit experts, 6/8-bit trunk. Qwen licence |
+| Swift-1.5-Flash-Next, Ijah T6 pack | [SiliconSpecies/Swift-1.5-Flash-Next-EXL3-Ijah](https://huggingface.co/SiliconSpecies/Swift-1.5-Flash-Next-EXL3-Ijah) | 83 GB | Same format. Swift Open License 1.0, non-commercial |
+| n-gram embedding table (both models) | [SiliconSpecies/Qwen3.8-Flash-Next-ngram-table](https://huggingface.co/SiliconSpecies/Qwen3.8-Flash-Next-ngram-table) | 102 GB | bf16, Qwen's own, unchanged |
+| Qwen3.8-Flash-Next, Ijah 4-bit pack | [SiliconSpecies/Qwen3.8-Flash-Next-EXL3-Ijah-4bit](https://huggingface.co/SiliconSpecies/Qwen3.8-Flash-Next-EXL3-Ijah-4bit) | 67 GB | Sushi's 4-bit EXL3 experts, the same 6/8-bit trunk. Faster, with 1.5-2x the KLD: **the T6 pack is preferred**. Qwen licence |
+| DFlash2 draft model (used by default) | [incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) | 1.2 GB | Inco's 0.6B block drafter. Apache-2.0 |
 
-The charts are pre-rendered. `tools/make_charts.py` redraws them from the per-window results in `data/charts/`.
+The **Ijah 4-bit** pack in the charts is the 4-bit pack above (called K4s-T6 in the docs).
 
-## How the packs were made
+## What's new (v0.2)
 
-The published packs start from Qwen's bf16 weights (and UkisAI's for Swift-1.5), quantized with our own EXL3
-converter, which follows exllamav3's trellis method:
+- **DFlash2 by default, with an exact verify gate.** Every model id loads Inco's 0.6B drafter next to the model's own
+  MTP head when the drafter is downloaded, and falls back to the MTP head when it is not. The earlier public version had
+  a bias: whether a draft was verified could depend on the drafted token itself, which shifts the sampled distribution.
+  That is fixed. The decision now never depends on the drafted token, which a 2-million-sample host test and a GPU
+  distribution check confirm. Block drafts stop past 8K tokens of context, because they help at short context (+7-15%
+  decode) and break even at 8-32K.
+- **Grouped routed-expert verify kernels.** When several rows are verified at once, each expert's weights are read
+  once per verify cycle instead of once per row. The output is bit-identical.
+- **The `ijah` command and a Homebrew tap**: `ijah serve`, `ijah download` (pinned revisions), `ijah link`,
+  `ijah models`, `ijah doctor`; `brew install publicExcess/ijah/ijah` and `brew services start ijah`.
+- **The 4-bit pack is published** (see Models); the T6 pack stays the preferred one.
+- **Opt-in lookahead gate** (`--dflash-gate 2`), following Splash's verify-row selection.
+- **Fixes.** `--models all` loads the base and Swift-1.5 models (each with its drafter). Each model id has its own
+  drafter. A missing required drafter is a clear error at start, and a request for an id the server does not serve
+  (or for the drafter where it is not loaded) is a 400 that says what to do. The RAM watchdog stops the whole server
+  process tree. `tools/gguf_logits.cpp` and `tools/kld_gguf.sh` reproduce the GGUF KLD numbers below.
 
-- **Routed experts:** 5 bits per weight. Calibration is a whole-model activation-count importance matrix over 280K
-  tokens, and the encoding uses LDLQ on the rotated Hessian.
-- **Trunk:** the attention, Gated DeltaNet and shared-expert projections at 6 bits, with full Hessians captured layer
-  by layer. The hyper-connection up-mixes and per-layer-embedding projections are at 8 bits, and the final mixer stays
-  in bf16.
-- **From Sushi's 4bpw pack** (credited in the model cards): the MTP head and its experts, the embeddings, lm_head,
-  routers, norms and vision tower.
-- **The n-gram embedding table** is Qwen's own, unchanged.
+## How we measured
 
-The conversion tools are not part of this first release; they are planned for a later version.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/charts/kld-dark.svg">
+    <img src="assets/charts/kld-light.svg" width="760" alt="Bar chart of KL divergence from bf16 on set B: Ijah T6 0.0092, Ijah 4-bit 0.0185, Splash 1.4 UD-IQ4_XS 0.0361, Splash 1.4 Q4_0 0.1148, oMLX oQ4e 0.0360.">
+  </picture>
+</p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/charts/speed-dark.svg">
+    <img src="assets/charts/speed-light.svg" width="820" alt="Bar charts of decode, 10K prefill and 32K prefill speed for the five engine and weight pairs. The numbers are in the speed table.">
+  </picture>
+</p>
 
-## Tests
+**Quality.** Teacher-forced KL divergence from the bf16 model over the full vocabulary, with the same teacher and the
+same token positions for every arm. Set B is reasoning traces (16 windows) and is the one we trust most. Set C is a 32K-token
+code and prose context (4 windows). Set A is wikitext-2 (16 windows). Ijah and oMLX were scored through their own
+engines. The GGUFs were scored from llama.cpp's full-vocabulary f32 logits, not through Splash's kernels.
 
-```sh
-make test-cpu     # CPU only: chat layer, sampling, grammar, prefix cache, HTTP API on a mock engine, supervisor
-make test         # core self-tests on the GPU (light) and the MTP accept rules; pack-dependent parts skip
-```
+| engine + weights | KLD B | KLD C | KLD A | top-1 B |
+|---|---:|---:|---:|---:|
+| Ijah T6 (EXL3, 5-bit experts, 6/8-bit trunk) | **0.0092** | **0.0148** | **0.0332** | **97.5%** |
+| Ijah 4-bit (EXL3, 4-bit experts, 6/8-bit trunk) | 0.0185 | 0.0236 | 0.0513 | 96.6% |
+| UD-IQ4_XS GGUF (Unsloth; mostly 3-bit experts, 8-bit trunk) | 0.0361 | 0.0539 | 0.1032 | 94.7% |
+| oQ4e (Jundot; mixed 4-8-bit, 4.72 bpw) | 0.0360 | 0.0780 | 0.1277 | 93.8% |
+| Q4_0 GGUF (bartowski) | 0.1148 | 0.1803 | 0.2614 | 89.0% |
 
-The CPU tests read the packs' tokenizer and chat template, and the small files are enough. Run
-`hf download SiliconSpecies/<repo> --include '*.json' '*.jinja' --local-dir ~/.cache/ijah/packs/<repo>` for both
-repos. Without them those tests report SKIP. The whole-model tests (`tests/server/*_job.sh`, `make test-quality`, ...)
-load the full model. Some of them compare against an MLX reference: `requirements-ref.txt`, plus EXL3 reference
-modules that are not part of this repository (see `docs/reference.md`).
+**Speed.** One streaming OpenAI-compatible client for every engine, one engine loaded at a time, sampling at
+temperature 1.0, top-p 0.95, top-k 20, with thinking on at medium effort. <!-- speed-n -->Decode: 6 prompts (code, maths, prose) x 3 seeds, 1,024 generated tokens each. We report the mean with a 95% confidence interval. Prefill: cold 10K and 32K-token prompts with no cache hit, 3 runs each, timed to the first streamed token, as the median with the min-max range.<!-- /speed-n -->
+Engines: Ijah T6 and Ijah 4-bit with MTP and the DFlash2 drafter (the default since v0.2), and Ijah T6 with MTP alone
+(`--drafter none`);
+Splash 1.4.0 (source build) at its defaults, which include its DFlash2 drafter and int8 KV; oMLX 0.7.1.dev1 with MTP
+at depth 2 and INT8-activation prefill.
+Machine: Apple M5 Max (40-core GPU), 128 GB, macOS 27, 23 October 2026.
 
-## Repository layout
-
-- `core/`: device, pack loader, recorder and C API.
-- `kernels/`: the Metal kernels.
-- `models/flash_next/`: the layer graph, MTP, prefill and vision.
-- `server/`: the HTTP server, chat layer and prefix cache.
-- `tools/`, `tests/`: tooling and tests.
-
-The design is in `ARCHITECTURE.md`. The `docs/` notes are the engineering notebooks from development, with
-measurements, dead ends and traps, kept as written (the run logs they cite are not included). Their `lab-*` names are the work areas the engine was built in.
-They call packs by their internal names: K5-T6 is the published Qwen3.8 pack and Swift-1.5-...-T6 the published Swift
-pack. K5 and K5-a16 are the earlier 8-bit-trunk packs, which are not published.
+<!-- speed-table -->
+| engine + weights | decode tok/s (mean, 95% CI) | prefill 10K tok/s (median, min-max) | prefill 32K tok/s (median, min-max) |
+|---|---:|---:|---:|
+| Ijah T6 + DFlash2: EXL3, 5-bit experts, 6/8-bit trunk | 122.3 [113.8, 130.4] | 1,867 (1,858-2,202) | 1,898 (1,884-1,907) |
+| Ijah T6 (MTP): EXL3, 5-bit experts, 6/8-bit trunk | 111.3 [107.0, 115.4] | 2,040 (2,037-2,071) | 2,043 (2,039-2,050) |
+| Ijah 4-bit + DFlash2: EXL3, 4-bit experts, 6/8-bit trunk | 133.0 [123.1, 142.2] | 2,210 (2,059-2,370) | 2,110 (2,106-2,113) |
+| Splash 1.4 · UD-IQ4_XS: Unsloth GGUF, mostly 3-bit experts | 128.1 [114.9, 141.2] | 2,296 (2,295-2,301) | 2,191 (2,188-2,217) |
+| Splash 1.4 · Q4_0: bartowski GGUF, 4-bit | 131.5 [119.5, 143.7] | 2,474 (2,401-2,511) | 2,281 (2,266-2,293) |
+| oMLX · oQ4e: Jundot, mixed 4-8-bit (4.72 bpw) | 92.3 [86.4, 98.2] | 2,184 (1,744-2,342) | 2,713 (2,701-2,732) |
+<!-- /speed-table -->
 
 ## Limitations
 
-- **One machine.** All numbers come from a single M5 Max; other configurations will differ. Run-to-run drift from
-  temperature is about 3–8%, so we interleave engines and compare in pairs. Differences under ~1% are not resolvable.
-- **Engine + weights, not engine alone.** Ijah's quality lead comes largely from its EXL3 weights. oMLX's decode and
-  prefill lead comes partly from its cheaper-to-unpack 4-bit weights. oMLX was run with settings we chose, not tuned
-  by its authors.
-- **Synthetic, single-turn benchmarks.** Real agent sessions mix prefill and decode differently, and their wall-clock
-  time depends mostly on how much the model writes.
-- **Few long-context windows.** Set C has only 4 windows, so its intervals are wide.
-- **KL divergence is not task accuracy.** It measures closeness to the unquantised model, not benchmark scores.
-- **Narrow scope.** Ijah runs only Qwen3.8-Flash-Next and its Swift-1.5 fine-tune, needs an Apple M5 GPU and ~90 GB of
-  unified memory, and serves one request at a time by default. Flash-Next is a preview of the Qwen4 architecture, so
-  expect changes. This is research code with no support promise.
+- **Speed parity, not a speed win.** With 4-bit experts Ijah runs at about the speed of the other 4-bit engines. Its
+  lead is fidelity: the published 5-bit pack is closer to bf16 and somewhat slower than the 4-bit packs. Prefill is not
+  a lead either: Splash is fastest at 10K tokens and oMLX at 32K.
+- **Engine plus weights.** Each engine runs its own weight format, so the comparison is of engine plus weights, not of
+  engines alone. The packs differ in size too: the GGUFs store a roughly 4-bit n-gram table, Ijah's is bf16.
+- **One machine, synthetic prompts.** All numbers come from one M5 Max, and run-to-run drift is about 3-8%. Real agent
+  sessions mix prefill and decode differently.
+- **KLD caveats.** KL divergence measures closeness to bf16, not task accuracy. Set C has only 4 windows, so treat it
+  as indicative. The GGUF numbers come from llama.cpp's logits, so they show the weights and not Splash's kernels.
+- **Narrow scope.** Ijah runs one model family on M5 GPUs only and serves one request at a time by default.
+  Flash-Next previews the Qwen4 architecture, so expect changes. This is research code with no support promise.
 
-## Credits
+## Credits and licence
 
-Ijah builds on other people's work. The licences and details are in `NOTICE` and `THIRD_PARTY_NOTICES.md`, and the
-source comments name each upstream file.
+Ijah is Apache-2.0 (`LICENSE`). It builds on other people's work. The licences are in `NOTICE` and
+`THIRD_PARTY_NOTICES.md`, and the source comments name each upstream file.
 
-- [sushi](https://github.com/beamivalice/sushi) (Theinruj Toranavikrai, David Dalcu; MIT): the EXL3 MoE prefill
+- [Sushi](https://github.com/beamivalice/sushi) (Theinruj Toranavikrai, David Dalcu; MIT): the EXL3 MoE prefill
   kernels and the pipelined gated-delta scan are ported from it. Its EXL3 decode, QSA selection and NAX layouts shaped
-  ours.
+  ours. The packs reuse its MTP head, embeddings, routers, norms and vision tower.
 - [exllamav3](https://github.com/turboderp-org/exllamav3) (turboderp; MIT): the EXL3 trellis format and its encoder.
 - [MLX](https://github.com/ml-explore/mlx) (Apple; MIT): the vendored NAX GEMM and attention headers, and math helpers.
-- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) (Prince Canuma; MIT): the reference model the engine is tested
-  against, and the image preprocessing.
-- [oMLX](https://github.com/jundot/omlx) (jundot; Apache-2.0): the comparison engine. Our gated-delta scan derives
-  from its kernel, and our INT8-activation prefill follows its approach.
+- [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) (Prince Canuma; MIT): the reference model and the image preprocessing.
+- [oMLX](https://github.com/jundot/omlx) (jundot; Apache-2.0): our gated-delta scan derives from its kernel, and our
+  INT8-activation prefill follows its approach.
+- [Splash](https://github.com/incoai/splash) and [Inco](https://inco.ai/blog/dflash2/) (Apache-2.0): the DFlash2 draft
+  model, and the design ideas behind our verify-row choice and lookahead gate (Splash 1.4.0, PR #487).
+  [z-lab DFlash](https://github.com/z-lab/dflash): the block-drafter architecture and generation loop.
 - [TensorFold](https://github.com/ashhart/TensorFold): the MTP copy-draft rule.
 - [Splish](https://github.com/publicExcess/splish): the pruned draft vocabulary.
-- [Inco](https://inco.ai/blog/dflash2/) and [z-lab](https://github.com/z-lab/dflash) (Apache-2.0): the DFlash2 block
-  drafter, opt-in with `--drafter dflash2` (the draft model is `incoai/Qwen3.8-Flash-Next-DFlash2`).
-- The Qwen team, for Qwen3.8-Flash-Next (Qwen community licence).
-- UkisAI, for the Swift-1.5 fine-tune (Swift Open License 1.0, non-commercial).
-
-## Status
-
-Research code, published as it is. Issues and pull requests are welcome, but there is no promise of support or of a
-stable interface. Licensed under the Apache License 2.0 (`LICENSE`).
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT): the GGUF logits for the quality comparison. Comparison
+  weights by Unsloth (UD-IQ4_XS), bartowski (Q4_0) and Jundot (oQ4e).
+- The Qwen team for Qwen3.8-Flash-Next (Qwen licence) and UkisAI for Swift-1.5 (Swift Open License 1.0,
+  non-commercial).

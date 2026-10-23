@@ -961,3 +961,26 @@ warned once per name in serve.log); it exists for the suites that send `"model":
 scheduler launches) and for legacy clients. It never applies when several models are served - there the name is the
 only thing deciding which model answers. Tests: `tests/server/test_model_id.py` (13 checks, no engine, no GPU, no
 port; runs in `run_mock.sh`). Related: docs/mtp.md 13.7.
+
+## 14. DFlash2 by default (release, 23 Oct 2026)
+
+The user's decision of 23 Oct: the plain model ids use the DFlash2 block drafter (docs/mtp.md 13: Inco's 0.6B drafter,
+the exact sequential gate `--dflash-gate 1`, block drafts only up to `--dflash-max-ctx 8192` context tokens; the MTP
+head drafts the rest).
+
+- `server/models.json`: each plain id has a `drafter` entry (candidate checkpoint dirs, first with `config.json` +
+  `model.safetensors` wins; `--drafter-path` overrides). The `-dflash` ids are now `alias_of` entries.
+- `--drafter auto` (default; env `NE_DRAFTER`): the drafter when its checkpoint is present; otherwise the MTP head, with
+  one log line per model that names the download (`ijah download drafter`, or `hf download incoai/Qwen3.8-Flash-Next-DFlash2
+  --revision a22a1744e85c --local-dir ~/.cache/ijah/drafters/Qwen3.8-Flash-Next-DFlash2`). `--drafter dflash2`: refuse
+  to start without it. `--drafter none` (or `--mtp 0`): the MTP head only (the control arm of a benchmark).
+- A `-dflash` id at start (`--model-id X-dflash`) = `X` with the drafter required (missing: SystemExit before any
+  load; with `--drafter none`: refused). The process serves the plain id; requests may name either. A request for
+  `X-dflash` on a server that runs `X` without the drafter is a 400 that says so and how to get it, also with
+  `--allow-any-model`, so the 19 Oct property (section 13: a drafter request is never answered by the control) holds.
+  The reverse check (a plain id refused on a drafter server) is gone: the plain id is the drafter run now.
+- `--models all` = the plain ids (each with its drafter when present); `--with-drafters` is accepted and does nothing.
+- `GET /v1/models` adds `"drafter": "dflash2" | "mtp"` per id; `--list-models` prints the drafter each id would load.
+- Memory: each served model holds its own drafter (weights and buffers; the checkpoint is 1.2 GB).
+
+Tests: `tests/server/test_model_id.py` (alias, fallback, force-MTP, refusals; CPU, in `run_mock.sh`).

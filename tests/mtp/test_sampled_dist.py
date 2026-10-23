@@ -9,6 +9,11 @@ the target's filtered distribution p(. | prompt, x_P) (temperature 1, top-k 20, 
 1-row decode logits. Reports the empirical vs p total variation, the TV that sampling noise alone gives at this
 many runs (simulated from p), a chi-square over p's support, the share of rounds whose d_1 was accepted, and the
 same for out[2] vs the target's distribution given (x_P, out[1]) (computed per observed out[1]).
+
+--pool N (lab-dflfix): every output position, not just out[1] (always verified) -- N MTP runs (restore an MTP snapshot of
+the prompt, generate_from 1 + K tokens, sampler and MTP seeds varied) against N plain step-path samples from the same
+snapshot (the target itself), a two-sample chi-square per position t = 0 .. K (tokens with < 10 pooled samples merged)
+and per consecutive pair (t - 1, t). A gate that verifies a draft depending on its own value shows up at t >= 2.
 """
 import argparse
 import os
@@ -60,6 +65,78 @@ def compare(name, samples, p, rng):
     return pval >= 0.01 and outside == 0
 
 
+def chi2_p(x, k):
+    """upper tail of chi-square(k) at x (Wilson-Hilferty)"""
+    import math
+    if k <= 0:
+        return 1.0
+    z = ((x / k) ** (1 / 3) - (1 - 2 / (9 * k))) / math.sqrt(2 / (9 * k))
+    return 0.5 * math.erfc(z / math.sqrt(2))
+
+
+def two_sample(a, b, minc=10):
+    ca, cb = Counter(a), Counter(b)
+    keys = [k for k in set(ca) | set(cb) if ca[k] + cb[k] >= minc]
+    ra = len(a) - sum(ca[k] for k in keys)
+    rb = len(b) - sum(cb[k] for k in keys)
+    cells = [(ca[k], cb[k]) for k in keys] + ([(ra, rb)] if ra + rb > 0 else [])
+    na, nb = len(a), len(b)
+    chi = 0.0
+    for x, y in cells:
+        tot = x + y
+        ea, eb = tot * na / (na + nb), tot * nb / (na + nb)
+        chi += (x - ea) ** 2 / ea + (y - eb) ** 2 / eb
+    return chi, len(cells) - 1, chi2_p(chi, len(cells) - 1)
+
+
+def pooled(a, eng, m, mtp, ids, tok):
+    """--pool: MTP / DFlash generations vs the step path from one snapshot, every position"""
+    import ctypes as C
+    L = eng.lib
+    for f, r, at in (("ne_fn_mtp_feed", C.c_int, [C.c_void_p, C.c_void_p, C.c_int]),
+                     ("ne_fn_mtp_snapshot", C.c_void_p, [C.c_void_p]),
+                     ("ne_fn_mtp_restore", C.c_int, [C.c_void_p, C.c_void_p]),
+                     ("ne_fn_mtp_generate_from", C.c_int, [C.c_void_p, C.c_void_p, C.c_int, C.c_int, C.c_int, C.c_int,
+                                                          C.c_uint64, C.c_void_p, C.c_void_p, C.c_void_p, C.c_void_p,
+                                                          C.c_void_p])):
+        getattr(L, f).restype, getattr(L, f).argtypes = r, at
+    P = C.c_void_p(mtp.ptr)
+    K = a.pool_k
+    m.reset()
+    pre = np.ascontiguousarray(ids[:-1], np.int32)
+    eng._ok(L.ne_fn_mtp_feed(P, pre.ctypes.data, len(pre)), "feed")
+    snap = L.ne_fn_mtp_snapshot(P)
+    assert snap, eng.last_error()
+    last = np.ascontiguousarray(ids[-1:], np.int32)
+    out = np.zeros(K + 1, np.int32)
+    runs_m, runs_s = [], []
+    for s in range(a.pool):
+        eng._ok(L.ne_fn_mtp_restore(P, snap), "restore")
+        m.set_sampler(TEMP, TOP_P, TOP_K, 100000 + s)
+        k = L.ne_fn_mtp_generate_from(P, last.ctypes.data, 1, K + 1, -1, a.depth, 1000 + s, out.ctypes.data, None, None,
+                                      None, None)
+        assert k == K + 1, (k, eng.last_error())
+        runs_m.append(tuple(out.tolist()))
+        eng._ok(L.ne_fn_mtp_restore(P, snap), "restore")
+        m.set_sampler(TEMP, TOP_P, TOP_K, 500000 + s)
+        t, seq = int(ids[-1]), []
+        for _ in range(K + 1):
+            t = m.step(t, True)[0]
+            seq.append(t)
+        runs_s.append(tuple(seq))
+        if (s + 1) % 2000 == 0:
+            print(f"  {s + 1} / {a.pool} runs", flush=True)
+    ok = True
+    for t in range(K + 1):
+        chi, dof, pv = two_sample([r[t] for r in runs_m], [r[t] for r in runs_s])
+        chi2, dof2, pv2 = two_sample([r[t - 1:t + 1] for r in runs_m], [r[t - 1:t + 1] for r in runs_s]) if t else (0, 0, 1)
+        print(f"  out[{t}]: MTP vs step chi2 {chi:.1f} / {dof} dof, P {pv:.3f}" +
+              (f"; pair (out[{t - 1}], out[{t}]) chi2 {chi2:.1f} / {dof2} dof, P {pv2:.3f}" if t else ""), flush=True)
+        ok &= pv >= 1e-3 and pv2 >= 1e-3
+    print("sampled-dist pooled:", "OK" if ok else "CHECK")
+    return ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pack", default=refenv.ijah_paths.pack())
@@ -67,6 +144,9 @@ def main():
     ap.add_argument("--depth", type=int, default=3)
     ap.add_argument("--prompt", default="text_crisis")
     ap.add_argument("--dflash", default="", help="lab-dflash: DFlash2 checkpoint dir (its gated rounds draft)")
+    ap.add_argument("--dflash-gate", type=int, default=1, help="lab-dfllook: 1 sequential exact gate, 2 lookahead")
+    ap.add_argument("--pool", type=int, default=0, help="lab-dflfix: N runs per side of the pooled every-position check")
+    ap.add_argument("--pool-k", type=int, default=6, help="tokens after the first one per pooled run")
     a = ap.parse_args()
     tok = Tokenizer.from_file(str(Path(a.pack) / "tokenizer.json"))
     ids = tok.encode(B.chat(a.pack, B.THINK[a.prompt]), add_special_tokens=False).ids
@@ -78,7 +158,7 @@ def main():
         import ctypes as C
         en = eng.lib.ne_fn_dfl_enable
         en.restype, en.argtypes = C.c_int, [C.c_void_p, C.c_char_p, C.c_int, C.c_int, C.c_int, C.c_int]
-        if en(C.c_void_p(mtp.ptr), a.dflash.encode(), 8, max(4, a.depth), 8, 1):
+        if en(C.c_void_p(mtp.ptr), a.dflash.encode(), 8, max(4, a.depth), 8, a.dflash_gate):
             raise E.EngineError(eng.last_error())
     # find a spot with entropy: along the greedy continuation, position j whose token is certain under the filter
     # (so x_P = cont[j] whatever the seed) and whose next token has >= 5 ids and top <= 0.7
@@ -97,6 +177,10 @@ def main():
     ids = ids + cont[:j]
     print(f"prompt extended by {j} greedy tokens; next {tok.decode([cont[j]])!r} is certain, then "
           f"{len(dists[j + 1])} ids (top {max(dists[j + 1].values()):.2f})")
+    if a.pool:
+        ok = pooled(a, eng, m, mtp, ids, tok)
+        pack.close()
+        sys.exit(0 if ok else 1)
     m.set_sampler(TEMP, TOP_P, TOP_K, 1234)
     outs = []
     for s in range(a.runs):
