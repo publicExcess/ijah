@@ -84,7 +84,7 @@ struct Model {
   // lab-vision (image input): multimodal positions and image embeddings, set by the host before a prefill
   Tensor mrope;               // f32 [36 + 4 tmax]: rope invf + MRoPE header / table shared by the 12 attention layers
                               // (their attn::QsaCache::invf; qsa.metal mrope_pos). Zero header = text positions.
-  Tensor vfeat;               // bf16 [vcap][2560]: image embeddings (NE_VISION_ROWS rows, default 16384)
+  Tensor vfeat;               // bf16 [vcap][2560]: image embeddings (NE_VISION_ROWS rows, default 65536)
   std::vector<int32_t> vmap;  // cache row -> vfeat row (-1 or past the end: the token's embedding)
   int vcap = 0;
   // lab-dflash (docs/mtp.md 13): DFlash2 target features of every 1-row / 4-row step (set_dfl_capture): the 4-stream

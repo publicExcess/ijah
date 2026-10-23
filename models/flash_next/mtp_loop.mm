@@ -498,6 +498,16 @@ static Recorder &dfl_rebuild_rec(MtpLoop &L) {
 // after the model's state import (Model::gen bumped): the drafter's context from buf, or restarted at T
 static void dfl_import(MtpLoop &L, const void *buf) {
   if (!L.dfl) return;
+  // pfast: a state past the cap drafts with the MTP head (the run caps at its start, generate_impl): no context
+  // rebuild here, and no capture / upkeep in the feeds before that run (every agent turn past 8K restored its
+  // checkpoint, rebuilt the drafter's context and captured each chunk's feature rows for nothing). The rows would
+  // only matter below the cap, where dfl_sync restarts the context as for any capped state.
+  if (L.dfl->active && L.m->T > L.dfl->maxctx) {
+    dfl_reset(L, L.m->T);
+    L.dfl->capped = true;
+    L.dfl->gen = ~0ull;
+    return;
+  }
   const int64_t *h = (const int64_t *)buf;
   if (!h || h[0] != 1 || h[1] != L.m->T || h[2] < 0 || h[2] > dfl::W || h[2] > h[1]) {
     dfl_reset(L, L.m->T);

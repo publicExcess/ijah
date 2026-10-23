@@ -584,7 +584,7 @@ class App:
                     prompt, _, _ = V.expand_prompt(prompt, images)
                 except V.ImageError as e:
                     raise chat.RequestError(str(e))
-                cap = int(os.environ.get("NE_VISION_ROWS", 16384))
+                cap = int(os.environ.get("NE_VISION_ROWS", 65536))   # = the engine default (model.mm)
                 if sum(im.n_tokens for im in images) > cap:
                     raise chat.RequestError(f"images need {sum(im.n_tokens for im in images)} tokens > {cap} "
                                             "(NE_VISION_ROWS)")

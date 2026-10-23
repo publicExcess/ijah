@@ -219,7 +219,7 @@ std::unique_ptr<Model> load_model(const Pack &pack, int tmax, const Model *state
     for (auto &st : m->st)
       if (st.qc.tmax > 0) st.qc.invf = m->mrope;
     const char *vr = getenv("NE_VISION_ROWS");
-    m->vcap = vr ? std::max(1, atoi(vr)) : 16384;
+    m->vcap = vr ? std::max(1, atoi(vr)) : 65536;   // ~28 full-size images; 16384 filled up in long pi sessions
     m->vfeat = sf && sf->vcap == m->vcap ? sf->vfeat : alloc(DType::BF16, {m->vcap, HID});
   }
   int nple = 0;

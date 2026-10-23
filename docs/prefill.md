@@ -492,6 +492,78 @@ other.
   3-8% lower (2,039-2,099). Over a whole job, the same pf-check arm drifts 5-12% (2,227 -> 1,965 at 32K).
 - Arms therefore have to run back to back and interleaved; the effects of round 3 / 4 (< 1%) are below this noise.
 
+### 4i. The per-turn floor (pfast, 23 Oct): small chunks, the server's prefix match, the capped drafter
+
+**Where a pi turn's time goes.** The user's serve.log, 3,065 requests since 19 Oct: 27% of turns add 16-128 tokens, 36%
+add 128-1K. Median prefill at > 40K context: 16-40 new tokens 192 ms, 40-64 273, 64-128 328, 128-256 391, 256-512 485,
+512-1K 689. In-process (`tools/bench_turn.py`, now with `--dflash DIR` = the served drafter, `--lib`, and a per-turn
+split into chunk feeds / tail steps / checkpoint / MTP start), 50 new tokens at 65-90K: TTFT 182-203 ms = the 45-row
+chunk 143-158 + the generation prompt's 4 tail tokens as steps 21-26 + checkpoint 1 + MTP start 16-19. Feeding the tail
+inside the chunk (GDN / head / drafter state captured at the checkpoint row) would save <= ~20 ms: not done. Through
+the server (`tools/bench_turn_http.py`, NE_SRV_TRACE) a turn also pays render + tokenize 1-8 ms (incremental already),
+the admission wait (below) and the checkpoint restore ("prepared") 12-16 ms.
+
+**Single chunks at 16K, whole model, GPU ms per stage** (`bench_turn.py --profile 1 --pf-sizes ...`; `--prof-env`
+repeats the profile under engine-knob settings, each with new Prefills):
+
+| rows | total | trunk | expert GEMM | MoE glue | attention | GDN | HC |
+|---|---|---|---|---|---|---|---|
+| 16 | 91 | 34 | 38 | 9 | 4 | 1 | 4 |
+| 45 | 138 | 54 | 62 | 11 | 5 | 2 | 4 |
+| 64 | 181 | 92 | 61 | 15 | 5 | 3 | 4 |
+| 128 | 221 | 94 | 92 | 16 | 9 | 6 | 4 |
+| 500 | 369 | 126 | 151 | 27 | 31 | 22 | 11 |
+| 2000 | 975 | 304 | 325 | 84 | 125 | 95 | 37 |
+
+At 90K the 2000-row chunk's attention is 184 ms (17%; +59 over 16K): the long-context growth is not the turn lever. The
+expert GEMM at <= 128 rows reads every touched expert once (~200-300 per layer): a bandwidth floor.
+
+**Kept, exact:**
+1. **`prefix_cache.lcp` in blocks.** The old one compared the whole lists and binary-searched with full-length slices
+   on any mismatch: every turn whose previous reply re-renders differently, once per candidate (the conversation, its
+   checkpoints, SSD entries sharing the system prompt). 10.8 -> 0.65 ms per call at 190K tokens; equal to a reference
+   on 20,000 random pairs. It was the admission wait in NE_SRV_TRACE: 2 / 12 / 26 ms at 21K / 92K / 188K.
+2. **The DFlash2 drafter stays capped past its context cap on a state import** (`dfl_import`, mtp_loop.mm). Every turn
+   past 8K restored its checkpoint, which un-capped the drafter: a context rebuild on the GPU, the feature rows of each
+   chunk captured, drained and exported, all before the run re-capped it and drafted with the MTP head. Exact: the
+   drafter cannot draft above the cap either way; below it dfl_sync restarts the context as for any capped state.
+
+**Parked (env knobs, default = master):** `NE_T6_FOLD_MIN=1024` (fold only from 1K rows; chunk GPU ms at 16K, fold vs not:
+64 rows 185 / 145, 128 216 / 181, 256 273 / 241, 500 383 / 346, 750 505 / 483, 1000 619 / 616, 1500 872 / 889, 4096 2142
+/ 2352) and `NE_T6_SK_NARROW=128` (split-K for the narrow Linears -- HC down, shared gate / up -- up to 128 rows: trunk
+45 / 64 / 128 rows 53 / 62 / 65 -> 41 / 45 / 51 ms). Same client, both on, client TTFT medians of 4 (old / new):
+~21K 70 tokens 269 / 234, 550 519 / 503; ~92K 70-100 288 / 240, 530 562 / 518; ~188K 70-96 304 / 261, 530 578 / 560.
+They change rounding points: old vs new logits after the chunk (`tools/check_pfpath.py`, 32 teacher-forced steps) KL
+3.7e-3 (45 rows) .. 2.9e-2 (500), the same as old vs the 1-row decode path (5.1e-3 .. 3.3e-2). Paired teacher KLD
+(`kld_teacher.py --prefill N --max-pos N+1024`, new - old): N 100: B +0.00009 [-0.00112, +0.00156], C -0.00228
+[-0.00645, +0.00058]; N 500: B +0.00004 [-0.00004, +0.00010], C +0.00174 [+0.00079, +0.00239]; narrow split-K alone,
+N 48: B +0.00179 [+0.00027, +0.00411], C -0.00035 [-0.00118, +0.00029]. A reduction-order change "failing" B says the
+gate's per-window noise is as large as these effects: `tests/quality/pfast_null_gate.sh` (night job, not run) calibrates
+it with null arms and judges both knobs against the null spread.
+
+Also tried: the f16 tensor-op GEMM below 64 rows (`NE_T6_TG_MIN=17`: 45 rows trunk 61 vs 52 ms, kept off); split-K for
+every Linear to 64 rows (`NE_T6_SK=64`: no gain).
+
+**Same client, exact fixes only** (master tree vs lab/pfast, greedy, old / new / old / new):
+
+| context (prompt tokens) | new tokens | master TTFT ms | lab/pfast TTFT ms | change |
+|---|---|---|---|---|
+| 16.5-19.2K | ~70 | 277 | 262 | -15 (-5.5%) |
+| 17.0-19.7K | ~540 | 492 | 475 | -16 (-3.3%) |
+| 19.1-21.7K | ~2,030 | 1,211 (1,066-1,359) | 1,254 | +44 (master's spread) |
+| 66-69K | ~70 | 278 | 258 | -21 (-7.5%) |
+| 66.5-69.2K | ~540 | 546 | 506 | -40 (-7.3%) |
+| 68.6-71.3K | ~2,070 | 1,364 | 1,335 | -29 (-2.1%) |
+| 90.3-92.9K | ~70 | 295 | 268 | -27 (-9.1%) |
+| 90.8-93.4K | ~540 | 565 | 509 | -56 (-9.8%) |
+| 92.8-95.5K | ~2,070 | 1,401 | 1,339 | -62 (-4.4%) |
+
+(Medians of 4: 2 servers per arm x 2 reps, `tools/bench_turn_http.py --temperature 0`, max_tokens 16, server on :8143
+with a test key, `--dflash-kmax 5 --dflash-bits 8`, RAM-only prefix cache.) Trace medians at 65-90K, master -> lab: admission
+wait 8-12 -> 1 ms (lcp), "prepared" 12-15 -> 1.5 ms (no drafter rebuild); the rest is the chunk feeds' drafter capture.
+Greedy outputs: 18 / 18 turns identical to master in both lab servers (and master's two). make test ALL PASS,
+tests/server/run_mock.sh all passed.
+
 ## 5. Traps
 
 - (pfkern) MPP tensor-op GEMMs: a kernel's last dispatch on the shared `PfBuf::wd` needs a barrier after it (the next

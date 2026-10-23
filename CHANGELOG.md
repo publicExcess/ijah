@@ -1,6 +1,19 @@
 # Changelog
 
-## v0.2.0 (unreleased)
+## v0.2.1 (23 Oct 2026)
+
+**Fixes**
+- Image buffer: `NE_VISION_ROWS` now defaults to 65,536 rows (~335 MB, about 28 full-size images). The old 16,384
+  rows filled up in long agent sessions that resend screenshots every turn, and the request failed with
+  `images need N tokens > 16384`.
+- Faster first token on small turns (output unchanged): turns past 8K tokens of context no longer wake the DFlash2
+  drafter when their checkpoint is restored (the drafter does not draft there), and the prefix cache finds the
+  shared prefix about 16x faster on long conversations. Same client, M5 Max: 5-10% lower time to first token for
+  70-540-token turns at 18-91K context. Greedy output identical; `make test` passes.
+- Two prefill speedups that change rounding order (`NE_T6_FOLD_MIN`, `NE_T6_SK_NARROW`) ship off by default, pending a
+  calibrated quality test (`tests/quality/pfast_null_gate.sh`).
+
+## v0.2.0 (23 Oct 2026)
 
 **DFlash2 by default**
 - Every model id uses Inco's DFlash2 block drafter when it is downloaded (`ijah download drafter`, into

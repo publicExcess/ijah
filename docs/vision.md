@@ -36,7 +36,7 @@ frequencies) + i32 header {mlen, delta} + i32 [mlen][4] table; `qsa.metal mrope_
 < mlen, else row + delta. A zero header is the old text rope bit for bit (same float(row) * invf). Set by
 `ne_fn_model_set_mrope(m, pos3, n, delta)` before a prefill (host-synchronous); image rows by
 `ne_fn_model_set_image_rows(m, rows, k, feats)` (absolute cache rows, bf16 features; `NE_VISION_ROWS` = capacity,
-default 16384 rows = 84 MB). Both survive `reset()`; the server sets them for every request.
+default 65536 rows = 335 MB, about 28 full-size images; 16384 until v0.2.1). Both survive `reset()`; the server sets them for every request.
 
 ## 3. Rounding points of the tower (vs MLX 0.32.3, found on all 65536 bf16 inputs / real activations)
 

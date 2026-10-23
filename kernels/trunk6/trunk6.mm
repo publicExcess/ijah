@@ -329,6 +329,19 @@ static bool fold_on() {  // NE_T6_FOLD=0: the prep / GEMM / post path for bf16-i
   const char *e = getenv("NE_T6_FOLD");
   return !e || atoi(e) != 0;
 }
+// pfast: the folded W costs a dense Wf build per Linear and chunk (dense + fold_n passes over the whole matrix), which
+// only pays from ~1K rows: whole-model chunk GPU ms fold vs prep / GEMM / post at T 16K, 64 rows 185 vs 145, 128 216
+// vs 181, 500 383 vs 346, 750 505 vs 483, 1000 619 vs 616, 1500 872 vs 889, 4096 2142 vs 2352. NE_T6_FOLD_MIN = the
+// fewest rows that fold (read at record time). Default 64 = master: parked (23 Oct) until the night job
+// tests/quality/pfast_null_gate.sh judges it against the teacher-KLD gate's null spread; 1024 = the faster setting.
+static int fold_min_rows() {
+  const char *e = getenv("NE_T6_FOLD_MIN");
+  return std::max(64, e ? atoi(e) : 64);
+}
+static int tg_min_rows() {  // pfast A/B: the fewest rows on the f16 tensor-op GEMM (else pf_h16_hf); NE_T6_TG_MIN
+  const char *e = getenv("NE_T6_TG_MIN");
+  return std::max(1, e ? atoi(e) : 64);
+}
 static bool a8_skip(const std::string &name) {  // NE_T6_A8_SKIP=<comma list of Linear name parts>: those stay f16
   const char *e = getenv("NE_T6_A8_SKIP");
   if (!e || !*e) return false;
@@ -338,6 +351,13 @@ static bool a8_skip(const std::string &name) {  // NE_T6_A8_SKIP=<comma list of 
   return false;
 }
 
+// pfast: split-K rows for narrow Linears (read at record time; 0 = as wide ones = master, the default: parked like
+// NE_T6_FOLD_MIN). 128: whole-model trunk stage at T 16K, 45 / 64 / 128 rows 53 / 62 / 65 -> 41 / 45 / 51 ms (the HC
+// down and the shared expert's gate / up; at >= 64 rows only together with NE_T6_FOLD_MIN > rows).
+static int narrow_max_rows() {
+  const char *e = getenv("NE_T6_SK_NARROW");
+  return e ? atoi(e) : 0;
+}
 int splitk_max_rows() {  // read at record time (A/B: a new Prefill per value)
   const char *e = getenv("NE_T6_SK");
   return e ? atoi(e) : kSplitKRows;
@@ -399,7 +419,7 @@ void record_prefill(Recorder &r, const Linear &l, int M, const Arg &x, bool xf, 
                        MTLSizeMake((NSUInteger)ncho, (NSUInteger)((M + 7) / 8), 1), MTLSizeMake(256, 1, 1));
     return;
   }
-  if (!xf && M >= 64 && fold_on() && l.in % 32 == 0 && ldx == l.in) {  // folded W (pfkern): x bf16 straight into the GEMM, y straight out
+  if (!xf && M >= fold_min_rows() && fold_on() && l.in % 32 == 0 && ldx == l.in) {  // folded W (pfkern): x bf16 straight into the GEMM, y straight out
     record_dense_fold(R, l, fc, b);
     R("fold").dispatch(Pipelines::get("t6_fold_n", fc), {b.wd, l.svh, b.wd},
                        MTLSizeMake((NSUInteger)(l.in / 32), (NSUInteger)ncho, 1), MTLSizeMake(256, 1, 1));
@@ -423,7 +443,10 @@ void record_prefill(Recorder &r, const Linear &l, int M, const Arg &x, bool xf, 
   // b.part, reduced in a fixed order); bigger chunks keep the NAX GEMM.
   const int Mp = M <= 16 ? 16 : M <= 32 ? 32 : M <= 64 ? 64 : 128;
   int S = 0, ks = l.in;
-  if (M <= std::min(128, splitk_max_rows()) && b.part.buf) {
+  // pfast: narrow Linears (NP <= 640: the HC down 10240 -> 320, twice per layer) have NP / 64 = 5 column tiles over
+  // K = 10240 on the NAX GEMM, latency-bound at any small M: split K for them up to NE_T6_SK_NARROW rows (<= 128)
+  const bool narrow = NP <= 640 && M <= std::min(128, narrow_max_rows());
+  if ((M <= std::min(128, splitk_max_rows()) || narrow) && b.part.buf) {
     const int tg0 = NP / 32;
     S = std::max(1, std::min((kSplitKGroups + tg0 - 1) / tg0, l.in / 128));
     ks = (l.in / S + 31) / 32 * 32;
@@ -446,7 +469,7 @@ void record_prefill(Recorder &r, const Linear &l, int M, const Arg &x, bool xf, 
                  MTLSizeMake((NSUInteger)((M * NP + 255) / 256), 1, 1), MTLSizeMake(256, 1, 1));
       R("gemm").barrier();
     }
-  } else if (M >= 64 && tensor_gemm()) {  // pfkern: f16 on the MPP tensor op (t6_a8.metal)
+  } else if (M >= tg_min_rows() && tensor_gemm()) {  // pfkern: f16 on the MPP tensor op (t6_a8.metal)
     // 128 x 64 tiles over 4 simdgroups: in the model the 64 x 64 / 8-simdgroup variant ran 1.5-2x slower than in
     // isolation on the wide Linears (qkv 6.9 vs 3.3 ms); NE_T6_TALL=0 selects it for N > 640
     static const bool all_tall = !getenv("NE_T6_TALL") || atoi(getenv("NE_T6_TALL"));
@@ -477,7 +500,7 @@ struct T6HcUpP {  // = trunk6.metal T6HcUpP
 bool record_prefill_hcup(Recorder &r, const Linear &l, int M, const Arg &x, const Arg &normed, const Arg &xin, PfBuf &b,
                          const PfPhase *phase) {
   static const bool on = !getenv("NE_T6_HCUP") || atoi(getenv("NE_T6_HCUP"));  // NE_T6_HCUP=0: gemm + pf_hc_blockin
-  if (!on || !fold_on() || M < 64 || l.fmt != Fmt::EXL3 || l.out != 10240 || l.in % 32 != 0) return false;
+  if (!on || !fold_on() || M < fold_min_rows() || l.fmt != Fmt::EXL3 || l.out != 10240 || l.in % 32 != 0) return false;
   auto R = [&](const char *ph) -> Recorder & { return phase ? (*phase)(ph) : r; };
   const FunctionConstants fc = {FC::u32(10, (uint32_t)l.k),      FC::u32(11, (uint32_t)l.in),
                                 FC::u32(12, (uint32_t)l.out),    FC::u32(13, (uint32_t)l.had_in),

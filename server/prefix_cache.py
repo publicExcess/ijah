@@ -53,19 +53,21 @@ def parse_bytes(s):
     return int(float(s or 0))
 
 
-def lcp(a, b):
-    """length of the common prefix of two int lists (slices compare in C)"""
+def lcp(a, b, block=4096):
+    """length of the common prefix of two int lists (slices compare in C). pfast: forward in blocks, then within the
+    first block that differs -- O(prefix) element copies; the old whole-list compare + binary search copied up to
+    ~2 x 18 slices of the full length on every mismatch (10.8 ms vs 0.65 ms at 190K tokens; every request whose
+    previous reply re-renders differently paid it per candidate, ~26 ms queued at 188K, docs/prefill.md 4i)"""
     n = min(len(a), len(b))
-    if a[:n] == b[:n]:
-        return n
-    lo, hi = 0, n
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if a[:mid] == b[:mid]:
-            lo = mid
-        else:
-            hi = mid - 1
-    return lo
+    i = 0
+    while i + block <= n and a[i:i + block] == b[i:i + block]:
+        i += block
+    hi = min(n, i + block)
+    if a[i:hi] == b[i:hi]:
+        return hi
+    while a[i] == b[i]:   # (a difference lies in [i, hi))
+        i += 1
+    return i
 
 
 class Snap:

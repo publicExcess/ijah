@@ -220,6 +220,22 @@ static inline nfrag nax_wfrag_k(const device uint *words, uint lane) {
   if (nax_quads_fit(N)) return nax_quads(uint(exl3_window(words, end, W, false)), uint(exl3_window(words, end + W, W, false)), s0, s1, s4);
   return nax_quads(exl3_window(words, end, W, true), exl3_window(words, end + W, W, true), s0, s1, s4);
 }
+// DBG 3 (pfast, timing only): the raw trellis words a lane's fragment decode loads, xor-folded (no window extraction,
+// no MCG decode): separates the expert GEMM's read traffic from its decode ALU.
+template <uint N>
+static inline uint nax_wread(const device uint *words, uint lane) {
+  if (N == 64u) {
+    const uint source0 = (lane & 16u) + ((lane & 7u) << 1u);
+    const uint2 c = *(const device uint2 *)(words + source0);
+    return c.x ^ c.y ^ words[(source0 + 31u) & 31u];
+  }
+  constexpr uint W = N / 2u;
+  const uint end = 8u * N * (lane >> 4u) + N * (lane & 7u) +
+                   (nax_end(N, 1u, 5u) - nax_end(N, 0u, 5u)) * ((lane >> 3u) & 1u) + nax_end(N, 0u, 5u);
+  const uint a = ((end - 1u) >> 5u) % W, b = ((end + W - 1u) >> 5u) % W;
+  return words[a] ^ words[(a + W - 1u) % W] ^ words[(a + W - 2u) % W] ^
+         words[b] ^ words[(b + W - 1u) % W] ^ words[(b + W - 2u) % W];
+}
 static inline short2 nax_origin(uint lane) {
   const short qid = short(lane >> 2u);
   return short2(short(((qid & 2) | short(lane & 1u)) * 4), short((qid & 4) | short((lane >> 1u) & 3u)));
@@ -290,12 +306,19 @@ kernel void pf_moe_gemm(device const half *x [[buffer(0)]], device const ushort 
     const device uint *words = wp;
     wp += (size_t)OT * PACKED_W;
     nfrag w0, w1;
-    if (DBG == 1u) {
+    if (DBG == 3u) {
+      w0 = w1 = nfrag(0.0h);
+    } else if (DBG == 1u) {
       w0 = nfrag(half(lane) * 0.001h);
       w1 = nfrag(half(tk) * 0.001h);
     } else {
       w0 = nax_wfrag_k<N>(words, lane);
       w1 = nax_wfrag_k<N>(words + PACKED_W, lane);
+    }
+    if (DBG == 3u) {
+      const uint r = nax_wread<N>(words, lane) ^ nax_wread<N>(words + PACKED_W, lane);
+      d0[0] += float(r & 1u);
+      continue;
     }
     if (DBG == 2u) {
       for (short s = 0; s < 8; s++) { d0[s] += float(w0[s]); d0[8 + s] += float(w1[s]); }
@@ -330,6 +353,15 @@ PF_INST("pf_moe_gemm_gu_k5_w32_h_nodec", pf_moe_gemm, HID, INTER, 80u, 2u, half,
 PF_INST("pf_moe_gemm_dn_k5_w32_h_nodec", pf_moe_gemm, INTER, HID, 80u, 2u, half, 1u)
 PF_INST("pf_moe_gemm_gu_k5_w32_h_nomma", pf_moe_gemm, HID, INTER, 80u, 2u, half, 2u)
 PF_INST("pf_moe_gemm_dn_k5_w32_h_nomma", pf_moe_gemm, INTER, HID, 80u, 2u, half, 2u)
+#define PF_MOE_DBG(K)                                                                                       \
+  PF_INST("pf_moe_gemm_gu_k" #K "_w32_h_rdonly", pf_moe_gemm, HID, INTER, 16u * K, 2u, half, 3u)            \
+  PF_INST("pf_moe_gemm_dn_k" #K "_w32_h_rdonly", pf_moe_gemm, INTER, HID, 16u * K, 2u, half, 3u)
+PF_MOE_DBG(4)
+PF_MOE_DBG(5)
+PF_INST("pf_moe_gemm_gu_k4_w32_h_nodec", pf_moe_gemm, HID, INTER, 64u, 2u, half, 1u)
+PF_INST("pf_moe_gemm_dn_k4_w32_h_nodec", pf_moe_gemm, INTER, HID, 64u, 2u, half, 1u)
+PF_INST("pf_moe_gemm_gu_k4_w32_h_nomma", pf_moe_gemm, HID, INTER, 64u, 2u, half, 2u)
+PF_INST("pf_moe_gemm_dn_k4_w32_h_nomma", pf_moe_gemm, INTER, HID, 64u, 2u, half, 2u)
 PF_MOE_K(6)
 PF_INST("pf_moe_mid", pf_moe_mid, float)
 PF_INST("pf_moe_mid_h", pf_moe_mid, half)

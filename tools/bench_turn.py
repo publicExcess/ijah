@@ -62,7 +62,11 @@ def main():
     ap.add_argument("--policy", default="auto")
     ap.add_argument("--profile", type=int, default=1)
     ap.add_argument("--pf-sizes", default="1,4,16,32,64,128,256,512")
+    ap.add_argument("--prof-env", default="", help="'|'-separated env settings (K=V;K=V) the profile runs under in turn, "
+                    "each with new Prefills (engine knobs read at record time); '-' = as is")
     ap.add_argument("--real", type=int, default=1, help="profile with fresh real-text tokens (else a fixed synthetic run)")
+    ap.add_argument("--lib", default=str(ROOT / "build/libengine.dylib"))
+    ap.add_argument("--dflash", default="", help="DFlash2 drafter dir (the served -dflash id: block 8, kmax 5, 8-bit, gate 1)")
     ap.add_argument("--arms", default="", help="comma list of arms run in turn in this process (each from a reset):\n"
                     "binary = NE_SRV_PIECES=binary (the old piece split), single = the new; env:K=V[;K=V] sets "
                     "os.environ for that arm (engine knobs read per call)")
@@ -75,7 +79,8 @@ def main():
     UHEAD = [IMS] + enc("user\n")
     fill = Filler(tok)
     t0 = time.time()
-    be = B.RealBackend(ROOT, a.pack, a.ctx, 2, ROOT / "build/libengine.dylib", None, print)
+    drafter = dict(kind="dflash2", path=a.dflash, block=8, kmax=5, bits=8, gate=1, max_ctx=8192) if a.dflash else None
+    be = B.RealBackend(ROOT, a.pack, a.ctx, 2, Path(a.lib), None, print, drafter=drafter)
     print(f"load {time.time() - t0:.1f} s, mtp_cont {be.mtp_cont}", flush=True)
     S = None
 
@@ -118,6 +123,7 @@ def main():
 
     greedy = (0.0, 1.0, 1, 0)
     rows = []
+    split = []
 
     def turn(S, P, label):
         ev.clear()
@@ -137,8 +143,15 @@ def main():
         calls = " ".join(f"{e[0]}:{e[1]}={e[2]:.0f}" + (f"(pf {e[3]:.0f})" if len(e) > 3 else "") for e in ev)
         print(f"{label}: prompt {len(P)} cached {st['cached_tokens']} new {new} path {st['path']}: TTFT {ttft:.0f} ms, "
               f"prefill_ms {st['prefill_ms']:.0f}, snapshot {st.get('snapshot_ms', 0):.0f}, restore "
-              f"{st.get('restore_ms', 0):.0f} | {calls} | out {out[:4]}", flush=True)
+              f"{st.get('restore_ms', 0):.0f} | {calls} | out {out}", flush=True)
         rows.append((label, len(P), new, st["path"], ttft, st["prefill_ms"], calls))
+        # (pfast) the turn's prefill split: chunked feeds (>= 16 tokens), step feeds (< 16: the generation-prompt
+        # tail), checkpoint exports, the MTP start's own prefill part, the rest (Python, restore, bookkeeping)
+        ch = sum(e[2] for e in ev if e[0] in ("mfeed", "prefill") and e[1] >= 16)
+        tl = sum(e[2] for e in ev if e[0] in ("mfeed", "prefill") and e[1] < 16) + sum(e[2] for e in ev if e[0] == "step")
+        ck = sum(e[2] for e in ev if e[0] == "state_save")
+        ms0 = sum(e[3] for e in ev if e[0] == "mtp_from")
+        split.append((label, len(P), new, ttft, st["prefill_ms"], ch, tl, ck, ms0, st["prefill_ms"] - ch - tl - ck - ms0))
         return out
 
     def extend(P, out, n_new):
@@ -186,7 +199,17 @@ def main():
                     outs[arm].append(out)
                     P = P2
             if a.profile and ai == len(arms) - 1:
-                prof += profile(be, L, [int(x) for x in a.pf_sizes.split(",") if x], fill if a.real else None)
+                for pe in (a.prof_env.split("|") if a.prof_env else ["-"]):
+                    saved = dict(os.environ)
+                    if pe != "-":
+                        for kv in pe.split(";"):
+                            k, v = kv.split("=", 1)
+                            os.environ[k] = v
+                    print(f"--- profile env {pe}", flush=True)
+                    prof += [(pe,) + r for r in profile(be, L, [int(x) for x in a.pf_sizes.split(",") if x],
+                                                         fill if a.real else None)]
+                    os.environ.clear()
+                    os.environ.update(saved)
     if len(arms) > 1:
         a0 = arms[0]
         for arm in arms[1:]:
@@ -198,11 +221,15 @@ def main():
     print("|---|---|---|---|---|---|---|")
     for r in rows:
         print(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]} | {r[4]:.0f} | {r[5]:.0f} | {r[6]} |")
+    print("\n| turn | prompt | new | TTFT | prefill_ms | chunk feeds | tail steps | checkpoint | MTP start | rest |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
+    for r in split:
+        print(f"| {r[0]} | {r[1]} | {r[2]} | " + " | ".join(f"{x:.0f}" for x in r[3:]) + " |")
     if prof:
-        print("\n| T | n | path | wall ms | GPU ms | " + " | ".join(STAGES) + " |")
-        print("|---|---|---|---|---|" + "---|" * len(STAGES))
+        print("\n| env | T | n | path | wall ms | GPU ms | " + " | ".join(STAGES) + " |")
+        print("|---|---|---|---|---|---|" + "---|" * len(STAGES))
         for p in prof:
-            print(f"| {p[0]} | {p[1]} | {p[2]} | {p[3]:.1f} | {p[4]:.1f} | " + " | ".join(f"{x:.1f}" for x in p[5]) + " |")
+            print(f"| {p[0]} | {p[1]} | {p[2]} | {p[3]} | {p[4]:.1f} | {p[5]:.1f} | " + " | ".join(f"{x:.1f}" for x in p[6]) + " |")
 
 
 def profile(be, L, ns, fill=None):
