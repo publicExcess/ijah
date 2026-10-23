@@ -32,11 +32,11 @@ restarts.
 ## Quick start
 
 You need an **Apple M5** Mac on **macOS 27** (Ijah uses the Metal 4 tensor units; M1 to M4 do not work), about
-**90 GB of free unified memory** for one model at the full 262K context, **185 GB of disk** (83 GB pack plus the 102 GB
+**95 GB of free unified memory** for one model at the full 262K context, **185 GB of disk** (83 GB pack plus the 102 GB
 n-gram table), the Xcode command-line tools with the Metal toolchain (`xcodebuild -downloadComponent MetalToolchain`)
 and Python 3.11 or newer.
 
-With Homebrew (once the tap is published):
+With Homebrew:
 
 ```sh
 brew install publicExcess/ijah/ijah    # builds the engine, the server's Python env and the `ijah` command
@@ -118,7 +118,7 @@ The **Ijah 4-bit** pack in the charts is the 4-bit pack above (called K4s-T6 in 
 - **Fixes.** `--models all` loads the base and Swift-1.5 models (each with its drafter). Each model id has its own
   drafter. A missing required drafter is a clear error at start, and a request for an id the server does not serve
   (or for the drafter where it is not loaded) is a 400 that says what to do. The RAM watchdog stops the whole server
-  process tree. `tools/gguf_logits.cpp` and `tools/kld_gguf.sh` reproduce the GGUF KLD numbers below.
+  process tree. `tools/gguf_logits.cpp` and `tools/kld_gguf.sh` score a GGUF against a bf16 teacher the same way as the Ijah packs.
 
 ## How we measured
 
@@ -171,7 +171,7 @@ DFlash2 and 2,016 without it.
 ## Limitations
 
 - **Speed parity, not a speed win.** With 4-bit experts Ijah runs at about the speed of the other 4-bit engines. Its
-  lead is fidelity: the published 5-bit pack is closer to bf16 and somewhat slower than the 4-bit packs. Prefill is not
+  lead is fidelity: the recommended 5-bit T6 pack is closer to bf16 and somewhat slower than the 4-bit packs. Prefill is not
   a lead either: Splash is fastest at 10K tokens and oMLX at 32K.
 - **Engine plus weights.** Each engine runs its own weight format, so the comparison is of engine plus weights, not of
   engines alone. The packs differ in size too: the GGUFs store a roughly 4-bit n-gram table, Ijah's is bf16.
